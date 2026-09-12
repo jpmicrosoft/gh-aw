@@ -533,7 +533,9 @@ This protects against supply chain attacks where an AI agent could inadvertently
 
 ### What Is Protected
 
-The following are always protected unless explicitly excluded: package manifests such as `package.json`, `go.mod`, `go.sum`, `Gemfile`, `Pipfile`, `pyproject.toml`, and other runtime lockfiles; security configuration such as `CODEOWNERS` and `DESIGN.md`; agent instruction files such as `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, and other engine-specific instruction files; common top-level documentation such as `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, and `CODE_OF_CONDUCT.md`; and specific protected directories such as `.github/`, `.agents/`, `.githooks/`, and `.husky/`. Although `CHANGELOG.md` is part of the shared protected-file set, these PR handlers remove it from that set by default. Any top-level directory starting with `.` such as `.cursor/`, `.vscode/`, or `.devcontainer/` is protected, including newly created hidden configuration directories.
+The following are always protected unless explicitly excluded: package manifests such as `package.json`, `go.mod`, `go.sum`, `Gemfile`, `Pipfile`, `pyproject.toml`, and other runtime lockfiles; security configuration such as `CODEOWNERS` and `DESIGN.md`; agent instruction files such as `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, and other engine-specific instruction files; common documentation such as `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, and `CHANGELOG.md`; and specific protected directories such as `.github/`, `.agents/`, `.githooks/`, and `.husky/`. File names are matched by basename, so nested files such as `docs/CHANGELOG.md` are protected too. Any top-level directory starting with `.` such as `.cursor/`, `.vscode/`, or `.devcontainer/` is protected, including newly created hidden configuration directories.
+
+This fork retains changelog protection to preserve consuming workflows' existing publication policy. A workflow can still opt out explicitly with `protected-files.exclude`.
 
 ### Policy Options
 
@@ -565,7 +567,7 @@ safe-outputs:
 The `exclude` list names files by **basename** (e.g., `AGENTS.md`) or **path prefix** (e.g., `.agents/`) to remove from the default protected set. Dot-folder path prefixes in the `exclude` list (e.g. `.cursor/`) also opt that directory out of the general top-level-dot-folder protection rule. The remaining protected files still enforce the configured policy. This is useful when a workflow is explicitly designed to manage one specific instruction file or configuration directory without disabling all protection.
 
 :::tip[Workflows that update top-level Markdown files]
-`CHANGELOG.md` is excluded by default. If your workflow is explicitly designed to modify another protected root-level Markdown file such as `README.md`, add it to the `exclude` list so the agent can commit the change.
+If your workflow is explicitly designed to modify a protected Markdown file such as `README.md` or `CHANGELOG.md`, add it to the `exclude` list so the agent can commit the change.
 
 ```yaml wrap
 safe-outputs:

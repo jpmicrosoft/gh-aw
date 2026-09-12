@@ -305,9 +305,9 @@ func normaliseProtectedFilesPolicy(policy string) string {
 }
 
 func defaultProtectedFilesExclude(excludes []string) []string {
-	seen := make(map[string]struct{}, len(excludes)+1)
-	result := make([]string, 0, len(excludes)+1)
-	for _, file := range append([]string{"CHANGELOG.md"}, excludes...) {
+	seen := make(map[string]struct{}, len(excludes))
+	result := make([]string, 0, len(excludes))
+	for _, file := range excludes {
 		if file == "" {
 			continue
 		}

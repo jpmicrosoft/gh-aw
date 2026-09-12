@@ -484,7 +484,7 @@ index abc..def 100644
       expect(result.action).toBe("allow");
     });
 
-    it("should allow CHANGELOG.md while protecting adjacent top-level documentation", () => {
+    it("should allow an explicitly excluded CHANGELOG.md while protecting adjacent documentation", () => {
       const changelogResult = checkFileProtection(makePatch("CHANGELOG.md"), {
         protected_files: ["README.md", "CONTRIBUTING.md"],
         protected_files_policy: "request-review",
@@ -497,6 +497,18 @@ index abc..def 100644
       });
       expect(readmeResult.action).toBe("request_review");
       expect(readmeResult.files).toContain("README.md");
+    });
+
+    it.each(["docs/CHANGELOG.md", "docs/nested/CHANGELOG.md"])("should block %s despite a root-only changelog exclusion", filePath => {
+      const patch = makePatch(filePath, "docs/guide.md");
+      expect(checkExcludedFiles(patch, ["CHANGELOG.md"]).excludedFiles).toEqual([]);
+      expect(
+        checkFileProtection(patch, {
+          allowed_files: ["docs/**"],
+          protected_files: ["CHANGELOG.md"],
+          protected_files_policy: "blocked",
+        })
+      ).toEqual({ action: "deny", source: "protected", files: ["CHANGELOG.md"] });
     });
 
     it("should deny protected file even when it matches the allowlist (orthogonal checks)", () => {
@@ -701,6 +713,16 @@ index abc..def 100644
     it("should allow when files are within allowed-files list", () => {
       const result = checkFileProtectionPostApply(["src/index.js", "src/utils.js"], { allowed_files: ["src/**"] });
       expect(result.action).toBe("allow");
+    });
+
+    it.each(["docs/CHANGELOG.md", "docs/nested/CHANGELOG.md"])("should also block %s after applying the patch", filePath => {
+      expect(
+        checkFileProtectionPostApply([filePath, "docs/guide.md"], {
+          allowed_files: ["docs/**"],
+          protected_files: ["CHANGELOG.md"],
+          protected_files_policy: "blocked",
+        })
+      ).toEqual({ action: "deny", source: "protected", files: [filePath] });
     });
 
     it("should deny when files violate allowed-files (post-apply detection)", () => {
