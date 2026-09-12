@@ -1,5 +1,7 @@
-import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { createRequire } from "module";
+import { spawnSync } from "child_process";
+import { Writable } from "stream";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -117,13 +119,17 @@ describe("copilot_sdk_driver.cjs", () => {
       const realClearTimeout = global.clearTimeout;
       const cleanupTimeoutHandles = new Set();
       const clearedCleanupTimeoutHandles = new Set();
+      const referencedCleanupTimeoutHandles = new Set();
       const setTimeoutSpy = vi.spyOn(global, "setTimeout").mockImplementation((fn, delay, ...args) => {
         const handle = realSetTimeout(fn, delay, ...args);
         if (delay === 5_000) cleanupTimeoutHandles.add(handle);
         return handle;
       });
       const clearTimeoutSpy = vi.spyOn(global, "clearTimeout").mockImplementation(handle => {
-        if (cleanupTimeoutHandles.has(handle)) clearedCleanupTimeoutHandles.add(handle);
+        if (cleanupTimeoutHandles.has(handle)) {
+          clearedCleanupTimeoutHandles.add(handle);
+          if (handle.hasRef()) referencedCleanupTimeoutHandles.add(handle);
+        }
         return realClearTimeout(handle);
       });
 
@@ -140,8 +146,9 @@ describe("copilot_sdk_driver.cjs", () => {
         });
 
         expect(result.exitCode).toBe(0);
-        expect(cleanupTimeoutHandles.size).toBe(2);
-        expect(clearedCleanupTimeoutHandles.size).toBe(2);
+        expect(cleanupTimeoutHandles.size).toBe(3);
+        expect(clearedCleanupTimeoutHandles.size).toBe(3);
+        expect(referencedCleanupTimeoutHandles.size).toBe(3);
       } finally {
         setTimeoutSpy.mockRestore();
         clearTimeoutSpy.mockRestore();
@@ -465,8 +472,8 @@ describe("copilot_sdk_driver.cjs", () => {
         expect(result.exitCode).toBe(0);
         expect(result.hasOutput).toBe(true);
         expect(result.output).toContain("Issue filed successfully");
-        // disconnect is called twice: once by the watchdog and once in finally.
-        expect(disconnectWithSignal).toHaveBeenCalled();
+        // The watchdog unwinds the send; common cleanup disconnects exactly once.
+        expect(disconnectWithSignal).toHaveBeenCalledTimes(1);
         expect(stop).toHaveBeenCalledTimes(1);
       } finally {
         if (prevIdleMs === undefined) delete process.env.GH_AW_SDK_IDLE_MS;
@@ -1526,12 +1533,9 @@ describe("copilot_sdk_driver.cjs", () => {
       }
     });
 
-    it("returns threshold error when sendAndWait fails after catastrophic denial disconnect", async () => {
+    it("returns threshold error when sendAndWait fails in the same turn as catastrophic denials", async () => {
       let sessionConfig;
-      let disconnected = false;
-      const disconnect = vi.fn().mockImplementation(async () => {
-        disconnected = true;
-      });
+      const disconnect = vi.fn().mockResolvedValue(undefined);
       const stop = vi.fn().mockResolvedValue(undefined);
       const session = {
         sessionId: "session-max-tool-denials-disconnect",
@@ -1540,10 +1544,7 @@ describe("copilot_sdk_driver.cjs", () => {
           const denyRequest = { kind: "shell", commands: [{ identifier: "rm" }], fullCommandText: "rm -rf /tmp/x" };
           sessionConfig.onPermissionRequest(denyRequest);
           sessionConfig.onPermissionRequest(denyRequest);
-          if (disconnected) {
-            throw new Error("transport disconnected");
-          }
-          return { data: { content: "unexpected" } };
+          throw new Error("transport disconnected");
         }),
         disconnect,
       };
@@ -1583,6 +1584,567 @@ describe("copilot_sdk_driver.cjs", () => {
         }
       }
     });
+  });
+
+  describe("denial guard lifecycle", () => {
+    let harnesses;
+    let events;
+    let eventsStream;
+    let createStreamSpy;
+    let holdStream;
+    let finishStream;
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      vi.stubEnv("GH_AW_SDK_IDLE_MS", "30000");
+      vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      harnesses = [];
+      events = [];
+      holdStream = false;
+      finishStream = undefined;
+      eventsStream = new Writable({
+        write(chunk, _encoding, callback) {
+          events.push(JSON.parse(chunk.toString()));
+          callback();
+        },
+        final(callback) {
+          if (holdStream) finishStream = callback;
+          else callback();
+        },
+      });
+      createStreamSpy = vi.spyOn(require("fs"), "createWriteStream").mockReturnValue(eventsStream);
+    });
+
+    function releaseStream() {
+      holdStream = false;
+      const finish = finishStream;
+      finishStream = undefined;
+      if (finish && !eventsStream.destroyed) finish();
+    }
+
+    afterEach(async () => {
+      try {
+        releaseStream();
+        for (const harness of harnesses) {
+          harness.send.resolve(undefined);
+          harness.disconnectDone.resolve(undefined);
+          harness.stopDone.resolve(undefined);
+        }
+        await vi.runAllTimersAsync();
+        await Promise.allSettled(harnesses.map(harness => harness.running).filter(Boolean));
+      } finally {
+        eventsStream.destroy();
+        vi.restoreAllMocks();
+        vi.unstubAllEnvs();
+        vi.useRealTimers();
+      }
+    });
+
+    /** @param {string} sessionId */
+    function makeGuardHarness(sessionId) {
+      const send = Promise.withResolvers();
+      const sendStarted = Promise.withResolvers();
+      const disconnectDone = Promise.withResolvers();
+      const stopDone = Promise.withResolvers();
+      let onEvent;
+      let onPermissionRequest;
+      const unsubscribe = vi.fn();
+      const disconnect = vi.fn().mockResolvedValue(undefined);
+      const stop = vi.fn().mockResolvedValue(undefined);
+      const logger = vi.fn();
+      const coreLogger = { info: vi.fn(), warning: vi.fn() };
+      const session = {
+        sessionId,
+        on: vi.fn(handler => {
+          onEvent = handler;
+          return unsubscribe;
+        }),
+        sendAndWait: vi.fn(() => {
+          sendStarted.resolve(undefined);
+          return send.promise;
+        }),
+        disconnect,
+      };
+      class FakeCopilotClient {
+        start = vi.fn().mockResolvedValue(undefined);
+        createSession = vi.fn(async config => {
+          onPermissionRequest = config.onPermissionRequest;
+          return session;
+        });
+        stop = stop;
+      }
+      const harness = {
+        send,
+        sendStarted,
+        disconnectDone,
+        stopDone,
+        session,
+        unsubscribe,
+        disconnect,
+        stop,
+        logger,
+        coreLogger,
+        completed: vi.fn(),
+        rejected: vi.fn(),
+        running: null,
+        emit(type, data = {}) {
+          if (!onEvent) throw new Error("SDK event handler is not installed");
+          onEvent({ type, ephemeral: false, timestamp: new Date().toISOString(), data });
+        },
+        deny() {
+          if (!onPermissionRequest) throw new Error("SDK permission handler is not installed");
+          return onPermissionRequest({ kind: "shell", commands: [{ identifier: "denied" }], fullCommandText: "denied" });
+        },
+        run() {
+          harness.running = runWithCopilotSDK({
+            sdkUri: "http://127.0.0.1:3002",
+            prompt: "test prompt",
+            logger,
+            coreLogger,
+            maxToolDenials: 5,
+            permissionConfig: { allowedTools: ["shell(git:*)"] },
+            sdkModule: {
+              CopilotClient: FakeCopilotClient,
+              RuntimeConnection: { forUri: vi.fn(() => ({})) },
+              approveAll: () => ({ kind: "approve-once" }),
+            },
+          });
+          harness.running.then(harness.completed, harness.rejected);
+          return harness.running;
+        },
+      };
+      harnesses.push(harness);
+      return harness;
+    }
+
+    function tripGuard(harness) {
+      for (let count = 0; count < 5; count++) {
+        expect(harness.deny()).toEqual({ kind: "reject", feedback: "Tool invocation is not allowed by workflow tool permissions." });
+      }
+    }
+
+    it("returns failure on the fifth denial while send stays pending independently of successful disconnect", async () => {
+      const harness = makeGuardHarness("session-guard-independent-send");
+      const sendSettled = vi.fn();
+      harness.send.promise.then(sendSettled, sendSettled);
+      harness.run();
+      await harness.sendStarted.promise;
+
+      for (let count = 1; count <= 4; count++) {
+        expect(harness.deny().kind).toBe("reject");
+        await vi.advanceTimersByTimeAsync(0);
+        expect(events.filter(event => event.type === "guard.tool_denials_exceeded")).toHaveLength(0);
+        expect(harness.disconnect).not.toHaveBeenCalled();
+        expect(harness.completed).not.toHaveBeenCalled();
+      }
+      for (let count = 5; count <= 7; count++) expect(harness.deny().kind).toBe("reject");
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The old runner stays pending here even though disconnect has resolved.
+      expect(harness.completed).toHaveBeenCalledTimes(1);
+      expect(harness.completed).toHaveBeenCalledWith({
+        exitCode: 1,
+        output: "max tool denials threshold reached (5/5)",
+        hasOutput: false,
+        durationMs: 0,
+      });
+      expect(harness.rejected).not.toHaveBeenCalled();
+      expect(sendSettled).not.toHaveBeenCalled();
+      expect(harness.disconnect).toHaveBeenCalledTimes(1);
+      expect(harness.stop).toHaveBeenCalledTimes(1);
+      expect(harness.coreLogger.info).toHaveBeenCalledTimes(7);
+      expect(harness.coreLogger.warning).toHaveBeenCalledTimes(7);
+      expect(harness.logger).toHaveBeenCalledWith("[sdk-driver] tool denial 7/5: permission denied: shell(denied)");
+      expect(events.filter(event => event.type === "guard.tool_denials_exceeded")).toEqual([
+        {
+          type: "guard.tool_denials_exceeded",
+          timestamp: expect.any(String),
+          data: { denialCount: 5, threshold: 5, reason: "permission denied: shell(denied)" },
+        },
+      ]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("observes a guard fired during event subscription before send begins", async () => {
+      const harness = makeGuardHarness("session-guard-before-send");
+      const subscribe = harness.session.on.getMockImplementation();
+      harness.session.on.mockImplementation(handler => {
+        const unsubscribe = subscribe(handler);
+        tripGuard(harness);
+        return unsubscribe;
+      });
+      harness.run();
+      await harness.sendStarted.promise;
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(harness.completed).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 1, output: "max tool denials threshold reached (5/5)" }));
+      expect(harness.rejected).not.toHaveBeenCalled();
+      expect(harness.disconnect).toHaveBeenCalledTimes(1);
+      expect(events.filter(event => event.type === "guard.tool_denials_exceeded")).toHaveLength(1);
+    });
+
+    it("does not count ordinary tool execution failures as permission denials", async () => {
+      const harness = makeGuardHarness("session-guard-execution-failures");
+      harness.run();
+      await harness.sendStarted.promise;
+      for (let count = 0; count < 6; count++) {
+        harness.emit("tool.execution_start", { toolCallId: `failed-${count}`, toolName: "bash" });
+        harness.emit("tool.execution_complete", { toolCallId: `failed-${count}`, success: false, error: { message: "command failed" } });
+      }
+      for (let count = 0; count < 4; count++) harness.deny();
+      harness.send.resolve({ data: { content: "recovered from command failures" } });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(events.filter(event => event.type === "tool.execution_complete" && !event.data.success)).toHaveLength(6);
+      expect(events.filter(event => event.type === "guard.tool_denials_exceeded")).toHaveLength(0);
+      expect(harness.completed).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 0, output: "recovered from command failures" }));
+      expect(harness.coreLogger.warning).toHaveBeenCalledTimes(4);
+    });
+
+    it.each([
+      [false, true, false, 5_000],
+      [false, false, true, 5_000],
+      [false, true, true, 10_000],
+      [true, false, false, 5_000],
+      [true, true, false, 10_000],
+      [true, false, true, 10_000],
+      [true, true, true, 15_000],
+    ])("bounds cleanup (stream stalled: %s, disconnect stalled: %s, stop stalled: %s) at %dms", async (stallStream, stallDisconnect, stallStop, budgetMs) => {
+      const harness = makeGuardHarness(`session-guard-deadlines-${stallStream}-${stallDisconnect}-${stallStop}`);
+      holdStream = stallStream;
+      if (stallDisconnect) harness.disconnect.mockReturnValue(harness.disconnectDone.promise);
+      if (stallStop) harness.stop.mockReturnValue(harness.stopDone.promise);
+      harness.run();
+      await harness.sendStarted.promise;
+      const started = Date.now();
+      tripGuard(harness);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+      expect(eventsStream.writableEnded).toBe(true);
+      await vi.advanceTimersByTimeAsync(budgetMs - 1);
+      expect(harness.completed).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(Date.now() - started).toBe(budgetMs);
+      expect(harness.completed).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 1, output: "max tool denials threshold reached (5/5)" }));
+      expect(harness.rejected).not.toHaveBeenCalled();
+      expect(harness.disconnect).toHaveBeenCalledTimes(1);
+      expect(harness.stop).toHaveBeenCalledTimes(1);
+      expect(harness.logger.mock.calls.filter(([message]) => message.includes("cleanup operation timed out after 5000ms"))).toHaveLength(Number(stallStream) + Number(stallDisconnect) + Number(stallStop));
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("clears each deadline when its stage settles just before five seconds", async () => {
+      const harness = makeGuardHarness("session-guard-deadline-boundaries");
+      holdStream = true;
+      harness.disconnect.mockReturnValue(harness.disconnectDone.promise);
+      harness.stop.mockReturnValue(harness.stopDone.promise);
+      harness.run();
+      await harness.sendStarted.promise;
+      tripGuard(harness);
+      await vi.advanceTimersByTimeAsync(0);
+
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(harness.disconnect).not.toHaveBeenCalled();
+      releaseStream();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.disconnect).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(harness.stop).not.toHaveBeenCalled();
+      harness.disconnectDone.resolve(undefined);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.stop).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(4_999);
+      harness.stopDone.resolve(undefined);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(harness.completed).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 1 }));
+      expect(harness.logger.mock.calls.some(([message]) => message.includes("timed out"))).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each(["throw", "reject"])("logs cleanup failures that %s without replacing the guard or skipping later cleanup", async mode => {
+      const harness = makeGuardHarness(`session-guard-cleanup-${mode}`);
+      harness.unsubscribe.mockImplementation(() => {
+        harness.emit("assistant.message", { content: "late unsubscribe output" });
+        throw new Error("listener teardown failed");
+      });
+      vi.spyOn(eventsStream, "end").mockImplementation(() => {
+        if (mode === "throw") throw new Error("stream drain failed");
+        queueMicrotask(() => eventsStream.destroy(new Error("stream drain failed")));
+        return eventsStream;
+      });
+      for (const [cleanup, message] of [
+        [harness.disconnect, "disconnect failed"],
+        [harness.stop, "stop failed"],
+      ]) {
+        cleanup.mockImplementation(() => {
+          if (mode === "throw") throw new Error(message);
+          return Promise.reject(new Error(message));
+        });
+      }
+      harness.run();
+      await harness.sendStarted.promise;
+      tripGuard(harness);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(harness.completed).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 1, hasOutput: false, output: "max tool denials threshold reached (5/5)" }));
+      expect(harness.rejected).not.toHaveBeenCalled();
+      expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+      expect(eventsStream.end).toHaveBeenCalledTimes(1);
+      expect(harness.disconnect).toHaveBeenCalledTimes(1);
+      expect(harness.stop).toHaveBeenCalledTimes(1);
+      for (const message of ["listener teardown failed", "stream drain failed", "disconnect failed", "stop failed"]) {
+        expect(harness.logger).toHaveBeenCalledWith(expect.stringContaining(message));
+      }
+      expect(events.filter(event => event.type === "assistant.message")).toHaveLength(0);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each(["send first", "guard first"])("keeps the guard fatal when send succeeds in the same tick: %s", async order => {
+      const harness = makeGuardHarness(`session-guard-simultaneous-${order.replace(" ", "-")}`);
+      harness.run();
+      await harness.sendStarted.promise;
+      if (order === "send first") harness.send.resolve({ data: { content: "must not become success" } });
+      tripGuard(harness);
+      if (order === "guard first") harness.send.resolve({ data: { content: "must not become success" } });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(harness.completed).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 1, hasOutput: false, output: "max tool denials threshold reached (5/5)" }));
+    });
+
+    it("keeps a same-tick watchdog completion from overriding the fifth denial", async () => {
+      const harness = makeGuardHarness("session-guard-watchdog-race");
+      harness.run();
+      await harness.sendStarted.promise;
+      harness.emit("assistant.message", { content: "earlier assistant output" });
+      // Fire the watchdog without flushing the completion promise's reactions.
+      vi.advanceTimersByTime(30_000);
+      expect(harness.logger).toHaveBeenCalledWith(expect.stringContaining("post-completion idle watchdog fired after 30000ms"));
+      tripGuard(harness);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(harness.completed).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 1, hasOutput: true, output: "earlier assistant output" }));
+      expect(harness.logger.mock.calls.some(([message]) => message.includes("treating as completed"))).toBe(false);
+      expect(harness.disconnect).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["send", "drain", "close"])("does not turn an events stream error during %s into success", async phase => {
+      const harness = makeGuardHarness(`session-guard-stream-error-${phase}`);
+      const streamError = new Error("Timeout after 123ms waiting for session.idle");
+      if (phase === "drain") {
+        vi.spyOn(eventsStream, "end").mockImplementation(() => {
+          queueMicrotask(() => eventsStream.destroy(streamError));
+          return eventsStream;
+        });
+      } else if (phase === "close") {
+        vi.spyOn(eventsStream, "_destroy").mockImplementation((_err, callback) => {
+          queueMicrotask(() => callback(streamError));
+        });
+      }
+      harness.run();
+      await harness.sendStarted.promise;
+      harness.emit("assistant.message", { content: "partial output" });
+      if (phase === "send") eventsStream.emit("error", streamError);
+      else harness.send.resolve(undefined);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(harness.completed).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 1, hasOutput: true, output: "partial output" }));
+      expect(harness.rejected).not.toHaveBeenCalled();
+      expect(harness.logger).toHaveBeenCalledWith(expect.stringContaining(streamError.message));
+      expect(harness.disconnect).toHaveBeenCalledTimes(1);
+      expect(harness.stop).toHaveBeenCalledTimes(1);
+    });
+
+    it("quiesces late SDK events and handles losing send and cleanup rejections", async () => {
+      const harness = makeGuardHarness("session-guard-late-sdk-activity");
+      const unhandled = vi.fn();
+      const streamError = vi.fn();
+      const writeSpy = vi.spyOn(eventsStream, "write");
+      eventsStream.on("error", streamError);
+      process.on("unhandledRejection", unhandled);
+      harness.unsubscribe.mockImplementation(() => {
+        harness.emit("assistant.turn_end");
+        harness.emit("assistant.message", { content: "late unsubscribe output" });
+      });
+      harness.disconnect.mockImplementation(() => {
+        harness.emit("assistant.message", { content: "late disconnect output" });
+        return harness.disconnectDone.promise;
+      });
+      harness.stop.mockReturnValue(harness.stopDone.promise);
+      try {
+        harness.run();
+        await harness.sendStarted.promise;
+        harness.emit("assistant.message", { content: "earlier assistant output" });
+        tripGuard(harness);
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(harness.completed).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 1, hasOutput: true, output: "earlier assistant output" }));
+        const writesAtCompletion = writeSpy.mock.calls.length;
+
+        harness.emit("assistant.turn_start");
+        harness.emit("assistant.turn_end");
+        harness.emit("assistant.message", { content: "late output after return" });
+        harness.emit("tool.execution_start", { toolCallId: "late", toolName: "bash" });
+        harness.emit("tool.execution_complete", { toolCallId: "late", success: true });
+        harness.deny();
+        harness.send.reject(new Error("late send rejection"));
+        harness.disconnectDone.reject(new Error("late disconnect rejection"));
+        harness.stopDone.reject(new Error("late stop rejection"));
+        await vi.advanceTimersByTimeAsync(30_000);
+
+        expect(harness.rejected).not.toHaveBeenCalled();
+        expect(unhandled).not.toHaveBeenCalled();
+        expect(streamError).not.toHaveBeenCalled();
+        expect(writeSpy).toHaveBeenCalledTimes(writesAtCompletion);
+        expect(harness.logger).toHaveBeenCalledWith(expect.stringContaining("late disconnect rejection"));
+        expect(harness.logger).toHaveBeenCalledWith(expect.stringContaining("late stop rejection"));
+        expect(harness.disconnect).toHaveBeenCalledTimes(1);
+        expect(harness.stop).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        process.removeListener("unhandledRejection", unhandled);
+      }
+    });
+
+    it("preserves earlier output and flushes the complete fatal event to session JSONL before returning", async () => {
+      createStreamSpy.mockRestore();
+      const harness = makeGuardHarness("session-guard-persisted-failure");
+      const running = harness.run();
+      await harness.sendStarted.promise;
+      harness.emit("assistant.message", { content: "earlier assistant output" });
+      tripGuard(harness);
+      harness.send.resolve({ data: { content: "must not replace earlier output" } });
+      const result = await running;
+
+      expect(result).toMatchObject({ exitCode: 1, hasOutput: true, output: "earlier assistant output" });
+      const jsonl = fs.readFileSync(path.join(testSessionStateDir, harness.session.sessionId, "events.jsonl"), "utf8");
+      expect(jsonl.endsWith("\n")).toBe(true);
+      const entries = jsonl
+        .trimEnd()
+        .split("\n")
+        .map(line => JSON.parse(line));
+      expect(entries).toEqual([
+        { type: "assistant.message", timestamp: expect.any(String), data: { content: "earlier assistant output" } },
+        { type: "guard.tool_denials_exceeded", timestamp: expect.any(String), data: { denialCount: 5, threshold: 5, reason: "permission denied: shell(denied)" } },
+      ]);
+    });
+  });
+
+  describe("standalone denial guard lifecycle", () => {
+    it.each([false, true])(
+      "exits 1 with independently stalled SDK operations (retained SDK handle: %s)",
+      retainHandle => {
+        const childDir = fs.mkdtempSync(path.join(testSessionStateDir, "denial-guard-child-"));
+        const preloadPath = path.join(childDir, "copilot-sdk-denial-guard-preload.cjs");
+        const promptPath = path.join(childDir, "prompt.txt");
+        try {
+          fs.writeFileSync(promptPath, "test prompt");
+          fs.writeFileSync(
+            preloadPath,
+            `
+"use strict";
+const sessionModule = require(${JSON.stringify(require.resolve("./copilot_sdk_session.cjs"))});
+const runWithCopilotSDK = sessionModule.runWithCopilotSDK;
+const pending = () => new Promise(() => {});
+class FakeToolSet {
+  addBuiltIn() { return this; }
+}
+class FakeCopilotClient {
+  async start() {}
+  async createSession(config) {
+    let onEvent;
+    return {
+      sessionId: "standalone-denial-guard",
+      on(handler) { onEvent = handler; return () => {}; },
+      sendAndWait() {
+        if (${JSON.stringify(retainHandle)}) {
+          setInterval(() => {}, 1000);
+          onEvent({ type: "assistant.message", data: { content: "earlier assistant output" } });
+        }
+        for (let count = 0; count < 6; count++) {
+          const decision = config.onPermissionRequest({ kind: "shell", commands: [{ identifier: "denied" }], fullCommandText: "denied" });
+          if (decision.kind !== "reject") throw new Error("fixture permission was not denied");
+        }
+        return pending();
+      },
+      disconnect() {
+        process.stderr.write("fixture:disconnect\\n");
+        return pending();
+      },
+    };
+  }
+  stop() {
+    process.stderr.write("fixture:stop\\n");
+    return pending();
+  }
+}
+sessionModule.runWithCopilotSDK = options => runWithCopilotSDK({
+  ...options,
+  sdkModule: {
+    CopilotClient: FakeCopilotClient,
+    RuntimeConnection: { forUri: () => ({}) },
+    approveAll: () => ({ kind: "approve-once" }),
+    ToolSet: FakeToolSet,
+    BuiltInTools: { Isolated: [] },
+  },
+});
+`
+          );
+          const started = Date.now();
+          const child = spawnSync(process.execPath, ["--require", preloadPath, require.resolve("./copilot_sdk_driver.cjs")], {
+            encoding: "utf8",
+            timeout: 18_000,
+            killSignal: "SIGKILL",
+            env: {
+              ...process.env,
+              NODE_OPTIONS: "",
+              GH_AW_PROMPT: promptPath,
+              COPILOT_SDK_URI: "http://127.0.0.1:1",
+              COPILOT_CONNECTION_TOKEN: "inert-sdk-fixture",
+              COPILOT_MODEL: "fixture-model",
+              GH_AW_SESSION_STATE_BASE_DIR: childDir,
+              GH_AW_MAX_TOOL_DENIALS: "5",
+              GH_AW_SDK_IDLE_MS: "30000",
+              GH_AW_COPILOT_SDK_MULTI_PROVIDER_JSON: JSON.stringify({
+                model: "fixture-model",
+                providers: [{ name: "fixture", type: "openai", baseUrl: "http://127.0.0.1:1" }],
+                models: [{ id: "fixture-model", provider: "fixture" }],
+              }),
+              GH_AW_COPILOT_SDK_TOOL_CONFIG: JSON.stringify({
+                version: 1,
+                capabilities: { bash: true, edit: false, webFetch: false, webSearch: false, mcp: false, cliProxy: false },
+                permissions: { allowedTools: ["shell(git:*)"] },
+                explicitlyDisabledTools: [],
+              }),
+            },
+          });
+
+          expect(child.error, child.stderr).toBeUndefined();
+          expect(child.signal, child.stderr).toBeNull();
+          expect(child.status, child.stderr).toBe(1);
+          expect(Date.now() - started).toBeLessThan(18_000);
+          expect(child.stderr.match(/fixture:disconnect\n/g)).toHaveLength(1);
+          expect(child.stderr.match(/fixture:stop\n/g)).toHaveLength(1);
+          expect(child.stderr.match(/cleanup operation timed out after 5000ms/g)).toHaveLength(2);
+          expect(child.stderr).toContain("max tool denials threshold reached (5/5)");
+          expect(child.stderr).not.toContain("unhandled error");
+          const jsonl = fs.readFileSync(path.join(childDir, "standalone-denial-guard", "events.jsonl"), "utf8");
+          expect(jsonl.endsWith("\n")).toBe(true);
+          const entries = jsonl
+            .trimEnd()
+            .split("\n")
+            .map(line => JSON.parse(line));
+          expect(entries.filter(event => event.type === "guard.tool_denials_exceeded")).toEqual([
+            { type: "guard.tool_denials_exceeded", timestamp: expect.any(String), data: { denialCount: 5, threshold: 5, reason: "permission denied: shell(denied)" } },
+          ]);
+          if (retainHandle) expect(entries[0]).toMatchObject({ type: "assistant.message", data: { content: "earlier assistant output" } });
+        } finally {
+          fs.rmSync(childDir, { recursive: true, force: true });
+        }
+      },
+      20_000
+    );
   });
 
   describe("parsePermissionConfigFromServerArgs", () => {

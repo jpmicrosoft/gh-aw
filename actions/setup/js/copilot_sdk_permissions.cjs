@@ -14,7 +14,7 @@
 "use strict";
 
 const path = require("path");
-const { extractCommandNamesFromPipeline } = require("./bash_command_parser.cjs");
+const { extractCommandNamesFromPipeline, parseShellCommandSegments } = require("./bash_command_parser.cjs");
 
 /** @const {number} Default maximum number of permission denials before the session is stopped. */
 const MAX_TOOL_DENIALS_DEFAULT = 5;
@@ -88,8 +88,10 @@ function getEnvPositiveIntOrDefault(key, fallback, env = process.env) {
  */
 function summarizePermissionRequest(request) {
   switch (request.kind) {
-    case "shell":
-      return `shell(${String(request.fullCommandText || "").trim() || "unknown"})`;
+    case "shell": {
+      const fullCommand = typeof request.fullCommandText === "string" ? request.fullCommandText.trim() : "";
+      return `shell(${fullCommand || "unknown"})`;
+    }
     case "mcp":
       return `mcp(${request.serverName || "unknown"}.${request.toolName || "unknown"})`;
     case "url":
@@ -244,19 +246,17 @@ function buildCopilotSDKPermissionHandler(permissionConfig, approveAll, logOptio
     .map(tool => tool.slice("shell(".length, -1).trim())
     .filter(Boolean);
   const readablePathPatterns = shellRules.flatMap(extractReadablePathPatternsFromShellRule);
+  const scopedShellPrefixes = shellRules.flatMap(rule => {
+    if (!rule.endsWith(":*")) return [];
+    const prefix = rule.slice(0, -2).trim();
+    if (!/\s/.test(prefix)) return [];
+    const segments = parseShellCommandSegments(prefix, { allowRedirections: false });
+    return segments?.length === 1 && segments[0].length > 1 ? segments : [];
+  });
 
   /**
-   * Returns true if a single command identifier matches any of the shell rules.
-   *
-   * Three rule formats are recognised:
-   *  - **Wildcard** (`cmd:*`)  — the identifier must equal the prefix before `:*`.
-   *    Example: rule `"safeoutputs:*"` matches identifier `"safeoutputs"`.
-   *  - **Single-word** (`cmd`) — the identifier must equal the rule exactly.
-   *    Example: rule `"ls"` matches identifier `"ls"` only.
-   *  - **Full-command** (`cmd arg …`) — rules that contain a space are intentionally
-   *    **not** tested here.  They represent exact full-command constraints and are
-   *    only meaningful when compared against the whole command text, not against
-   *    individual pipeline stages.
+   * Only explicit single-executable rules authorize a legacy identifier.
+   * Scoped prefixes and exact whole-command rules are checked separately.
    *
    * @param {string} identifier - A single command name (e.g. "ls", "git", "safeoutputs")
    * @returns {boolean} True when any shell rule permits the identifier
@@ -265,9 +265,9 @@ function buildCopilotSDKPermissionHandler(permissionConfig, approveAll, logOptio
     return shellRules.some(rule => {
       if (rule.endsWith(":*")) {
         const prefix = rule.slice(0, -2).trim();
-        return prefix.length > 0 && identifier === prefix;
+        return prefix.length > 0 && !/\s/.test(prefix) && identifier === prefix;
       }
-      if (!rule.includes(" ")) {
+      if (!/\s/.test(rule)) {
         return identifier === rule;
       }
       return false;
@@ -282,71 +282,29 @@ function buildCopilotSDKPermissionHandler(permissionConfig, approveAll, logOptio
     switch (request.kind) {
       case "shell": {
         if (allowedToolEntries.has("shell")) return true;
-        const commandIdentifiers = Array.isArray(request.commands) ? request.commands.map(cmd => cmd?.identifier).filter(Boolean) : [];
-        const normalizedCommandIdentifiers = [
-          ...new Set(
-            commandIdentifiers.flatMap(identifier => {
-              const text = String(identifier || "").trim();
-              if (!text) return [];
-              const parsedNames = extractCommandNamesFromPipeline(text);
-              return parsedNames.length > 0 ? [text, ...parsedNames] : [text];
-            })
-          ),
-        ];
-        const fullCommand = String(request.fullCommandText || "").trim();
+        const fullCommand = typeof request.fullCommandText === "string" ? request.fullCommandText.trim() : "";
 
-        // Primary path: the SDK provided command identifiers.
-        // Use original matching logic: single-word and :* rules match identifiers,
-        // rules with spaces are compared against the full command text.
-        if (normalizedCommandIdentifiers.length > 0) {
-          return shellRules.some(rule => {
-            if (rule.endsWith(":*")) {
-              const prefix = rule.slice(0, -2).trim();
-              return prefix.length > 0 && normalizedCommandIdentifiers.includes(prefix);
-            }
-            if (!rule.includes(" ")) {
-              return normalizedCommandIdentifiers.includes(rule);
-            }
-            return fullCommand === rule;
-          });
+        // Exact grants constrain the whole request, never individual stages.
+        if (fullCommand && shellRules.some(rule => /\s/.test(rule) && !rule.endsWith(":*") && fullCommand === rule)) return true;
+
+        if (scopedShellPrefixes.length > 0) {
+          const segments = parseShellCommandSegments(request.fullCommandText);
+          if (segments !== null) {
+            return segments.length > 0 && segments.every(words => isIdentifierAllowedByShellRules(words[0]) || scopedShellPrefixes.some(prefix => prefix.every((token, index) => words[index] === token)));
+          }
         }
 
-        // Fallback path: SDK did not supply command identifiers (common for complex
-        // piped / chained commands such as `ls /tmp && cat file.json || echo "done"`).
-        // Parse fullCommandText to extract the executable name from each pipeline
-        // stage and verify that every stage is individually allowed.
-        if (fullCommand) {
-          const parsedNames = extractCommandNamesFromPipeline(fullCommand);
-
-          if (parsedNames.length > 1) {
-            // Multi-stage pipeline: ALL stages must be individually allowed.
-            // Exact full-command rules (with spaces) do not apply to individual
-            // pipeline stages — only single-word and :* prefix rules.
-            return parsedNames.every(name => isIdentifierAllowedByShellRules(name));
-          }
-
-          if (parsedNames.length === 1) {
-            // Single parsed command: apply the same logic as for a single SDK identifier,
-            // including exact full-command rule matching for rules that contain spaces.
-            const [name] = parsedNames;
-            return shellRules.some(rule => {
-              if (rule.endsWith(":*")) {
-                const prefix = rule.slice(0, -2).trim();
-                return prefix.length > 0 && name === prefix;
-              }
-              if (!rule.includes(" ")) {
-                return name === rule;
-              }
-              return fullCommand === rule;
-            });
-          }
-
-          // Could not extract any command names (e.g. complex subshell-only command).
-          // Last resort: try an exact full-command match against rules with spaces.
-          return shellRules.some(rule => rule.includes(" ") && !rule.endsWith(":*") && fullCommand === rule);
-        }
-
-        return false;
+        // A scoped parse failure cannot grant a scoped prefix or veto an
+        // independently valid legacy grant. Full text takes precedence over
+        // SDK identifiers so an any-match identifier cannot hide another stage.
+        const commandTexts = fullCommand ? [fullCommand] : Array.isArray(request.commands) ? request.commands.map(cmd => cmd?.identifier) : [];
+        return (
+          commandTexts.length > 0 &&
+          commandTexts.every(text => {
+            const names = typeof text === "string" ? extractCommandNamesFromPipeline(text) : [];
+            return names.length > 0 && names.every(isIdentifierAllowedByShellRules);
+          })
+        );
       }
       case "write":
         return allowedToolEntries.has("write");

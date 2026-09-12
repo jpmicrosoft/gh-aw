@@ -10,6 +10,7 @@
  *   - Split a shell command text on pipeline operators (&&, ||, |, ;)
  *   - Extract the executable command name from a shell segment
  *   - Extract all command names from a complex piped/chained command
+ *   - Strictly parse literal command segments for scoped permission grants
  *
  * This parser enables the permission checker to handle chained shell commands such as
  *   ls /tmp && cat file.json 2>/dev/null || echo "not found"
@@ -308,8 +309,189 @@ function extractCommandNamesFromPipeline(commandText) {
   return names;
 }
 
+/**
+ * @param {string} text
+ * @param {number} index
+ * @returns {number}
+ */
+function shellLineContinuationLength(text, index) {
+  if (text[index] !== "\\") return 0;
+  if (text[index + 1] === "\n") return 2;
+  if (text[index + 1] === "\r") return text[index + 2] === "\n" ? 3 : 2;
+  return 0;
+}
+
+/**
+ * Read one literal shell word, removing quotes and shell escapes but not
+ * evaluating expansions. Unsupported expansions must not become prefix tokens.
+ *
+ * @param {string} text
+ * @param {number} start
+ * @returns {{value: string, end: number} | null}
+ */
+function readLiteralShellWord(text, start) {
+  let value = "";
+  let quote = "";
+  let started = false;
+  let i = start;
+  /** @type {Array<{start: number, hasComma: boolean}>} */
+  const braces = [];
+
+  while (i < text.length) {
+    const ch = text[i];
+    if (quote === "'") {
+      if (ch === "'") quote = "";
+      else value += ch;
+      i++;
+      continue;
+    }
+    if (ch === "\\") {
+      const continuation = shellLineContinuationLength(text, i);
+      if (continuation > 0) {
+        i += continuation;
+        continue;
+      }
+      if (i + 1 >= text.length) return null;
+      const next = text[i + 1];
+      if (quote === '"' && !'$`"\\'.includes(next)) value += "\\";
+      value += next;
+      started = true;
+      i += 2;
+      continue;
+    }
+    if (ch === "$" || ch === "`") return null;
+    if (quote === '"') {
+      if (ch === '"') quote = "";
+      else value += ch;
+      i++;
+      continue;
+    }
+    if (/[ \t\r\n;&|<>]/.test(ch)) break;
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      started = true;
+      i++;
+      continue;
+    }
+    if ("()*?[]".includes(ch) || (ch === "#" && !started)) return null;
+    if (ch === "~" && (!started || /^[A-Za-z_][A-Za-z0-9_]*=(?:[^:]*:)*$/.test(value))) return null;
+    if (ch === "{") {
+      braces.push({ start: i + 1, hasComma: false });
+    } else if (ch === "," && braces.length > 0) {
+      braces[braces.length - 1].hasComma = true;
+    } else if (ch === "}") {
+      const brace = braces.pop();
+      if (brace) {
+        // HEAD@{1} is literal; only unquoted lists or sequences expand.
+        const body = text.slice(brace.start, i).replace(/\\(?:\r\n|\r|\n)/g, "");
+        if (brace.hasComma || /^(?:[+-]?\d+\.\.[+-]?\d+|[A-Za-z]\.\.[A-Za-z])(?:\.\.[+-]?\d+)?$/.test(body)) return null;
+      }
+    }
+    value += ch;
+    started = true;
+    i++;
+  }
+
+  return quote || !started ? null : { value, end: i };
+}
+
+/**
+ * @param {string} text
+ * @param {number} start
+ * @returns {number | null}
+ */
+function readShellRedirection(text, start) {
+  const operator = text.slice(start).match(/^(?:\d+)?(>>?|<)(?![<>])/);
+  if (!operator) return null;
+  let i = start + operator[0].length;
+
+  if (text[i] === "&") {
+    if (operator[1] === ">>") return null;
+    const descriptor = text.slice(i + 1).match(/^(?:\d+|-)(?=$|[ \t\r\n;&|<>])/);
+    return descriptor ? i + 1 + descriptor[0].length : null;
+  }
+
+  while (text[i] === " " || text[i] === "\t") i++;
+  const target = readLiteralShellWord(text, i);
+  return target ? target.end : null;
+}
+
+/**
+ * Parse a narrow, literal shell command sequence without deduplicating stages.
+ * Supports quotes, escapes, &&, ||, |, ;, line breaks and simple redirections.
+ * Redirections do not contribute argument tokens; disable them for rule prefixes.
+ *
+ * Unlike the legacy extractors, returns null for empty/malformed input or
+ * unsupported syntax: expansions, substitutions, background execution, comments,
+ * leading assignments/redirections, compound commands and heredocs. No partial
+ * result may authorize a scoped grant.
+ *
+ * @param {unknown} commandText
+ * @param {{allowRedirections?: boolean}} [options]
+ * @returns {string[][] | null} Non-empty literal token arrays in execution order, or null
+ */
+function parseShellCommandSegments(commandText, options) {
+  if (typeof commandText !== "string" || !commandText.trim() || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(commandText)) return null;
+
+  /** @type {string[][]} */
+  const segments = [];
+  /** @type {string[]} */
+  let words = [];
+  let needsCommand = false;
+  let i = 0;
+
+  function finishSegment() {
+    const [name] = words;
+    if (!name || name === "!" || name === "{" || name === "}" || SHELL_KEYWORDS.has(name) || ENV_ASSIGNMENT_PREFIX_RE.test(name)) return false;
+    segments.push(words);
+    words = [];
+    return true;
+  }
+
+  while (i < commandText.length) {
+    const ch = commandText[i];
+    if (ch === " " || ch === "\t") {
+      i++;
+      continue;
+    }
+    const continuation = shellLineContinuationLength(commandText, i);
+    if (continuation > 0) {
+      i += continuation;
+      continue;
+    }
+    if (ch === "\n" || ch === "\r") {
+      if (words.length > 0 && !finishSegment()) return null;
+      i += ch === "\r" && commandText[i + 1] === "\n" ? 2 : 1;
+      continue;
+    }
+    if (ch === "&" || ch === "|" || ch === ";") {
+      if (ch === "&" && commandText[i + 1] !== "&") return null;
+      if (!finishSegment()) return null;
+      i += ch === "&" || (ch === "|" && commandText[i + 1] === "|") ? 2 : 1;
+      needsCommand = true;
+      continue;
+    }
+    if (/^(?:\d+)?[<>]/.test(commandText.slice(i))) {
+      if (options?.allowRedirections === false || words.length === 0) return null;
+      const end = readShellRedirection(commandText, i);
+      if (end === null) return null;
+      i = end;
+      continue;
+    }
+    const word = readLiteralShellWord(commandText, i);
+    if (!word) return null;
+    words.push(word.value);
+    needsCommand = false;
+    i = word.end;
+  }
+
+  if (words.length > 0 && !finishSegment()) return null;
+  return !needsCommand && segments.length > 0 ? segments : null;
+}
+
 module.exports = {
   splitOnPipelineOperators,
   extractCommandName,
   extractCommandNamesFromPipeline,
+  parseShellCommandSegments,
 };

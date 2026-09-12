@@ -27,6 +27,10 @@
  * Consumed directly by copilot_sdk_driver.cjs (the built-in gh-aw driver) and
  * available to any custom driver that wants the same session lifecycle and JSONL
  * telemetry without duplicating the implementation.
+ *
+ * Fatal permission denials unwind independently of SDK send/disconnect progress.
+ * Cleanup drains events, disconnects the session, then stops the client, with a
+ * five-second deadline per stage (at most fifteen seconds of cleanup deadlines).
  */
 
 "use strict";
@@ -35,6 +39,7 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { finished } = require("stream/promises");
 const { buildCopilotSDKPermissionHandler, getEnvPositiveIntOrDefault, parseMaxToolDenialsLimit, MAX_TOOL_DENIALS_DEFAULT } = require("./copilot_sdk_permissions.cjs");
 const { buildCopilotSDKSessionToolConfig } = require("./copilot_sdk_tool_config.cjs");
 const { resolveModelWithFallback } = require("./model_fallback.cjs");
@@ -147,6 +152,10 @@ async function runWithCopilotSDK({
   const startTime = Date.now();
   let output = "";
   let hasOutput = false;
+  let exitCode = 1;
+  let durationMs = 0;
+  /** @type {Error | null} */
+  let failure = null;
 
   const log = msg => logger(`[sdk-driver] ${msg}`);
   log(`attempt ${attempt + 1}: connecting to Copilot SDK at ${sdkUri}`);
@@ -194,9 +203,21 @@ async function runWithCopilotSDK({
   let clientStarted = false;
   let toolDenialCount = 0;
   let assistantTurnCount = 0;
-  /** @type {any} */
+  /** @type {Error | null} */
   let catastrophicToolDenialsError = null;
   let catastrophicToolDenialsTriggered = false;
+  /** @type {Error | null} */
+  let eventsStreamError = null;
+  let shuttingDown = false;
+  /** @type {(() => void) | undefined} */
+  let unsubscribe;
+  /** @type {(error: Error) => void} */
+  let signalSessionTermination;
+  // Resolve rather than reject so a guard firing before send is observed safely.
+  /** @type {Promise<Error>} */
+  const sessionTermination = new Promise(resolve => {
+    signalSessionTermination = resolve;
+  });
   /**
    * Map from toolCallId → {toolName, mcpServerName} for enriching tool.execution_complete
    * events and for tracking in-flight tool calls when the idle-timeout fires.
@@ -208,10 +229,10 @@ async function runWithCopilotSDK({
   // Post-completion idle watchdog.
   // When the agent has produced output and all tracked tool calls have completed,
   // this timer is armed.  If no new SDK events arrive within GH_AW_SDK_IDLE_MS
-  // (default 5 minutes), the watchdog force-disconnects the session and the catch
+  // (default 30 seconds), the watchdog unwinds the send and the catch
   // block treats the result as a successful completion.  This bounds the damage
   // from the SDK driver bug where sendAndWait never resolves after the final
-  // tool result is returned.
+  // tool result is returned. Disconnect runs through the common bounded cleanup.
   const postCompletionIdleMs = getEnvPositiveIntOrDefault("GH_AW_SDK_IDLE_MS", SDK_POST_COMPLETION_IDLE_MS_DEFAULT);
   let postCompletionWatchdogTriggered = false;
   /** @type {ReturnType<typeof setTimeout> | null} */
@@ -223,15 +244,32 @@ async function runWithCopilotSDK({
   let inAssistantTurn = false;
 
   /**
-   * Best-effort write of a driver-level event to events.jsonl and stderr.
+   * @param {unknown} err
+   */
+  function recordEventsStreamError(err) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    if (eventsStreamError === error) return;
+    eventsStreamError ??= error;
+    log(`warning: events stream failed: ${error.message}`);
+    signalSessionTermination(error);
+  }
+
+  /**
+   * Write one JSONL entry to the events file and stderr.
    * @param {string} type
    * @param {any} data
+   * @param {string | undefined} [timestamp]
    */
-  function writeDriverEvent(type, data) {
-    const entry = { type, timestamp: new Date().toISOString(), data };
+  function writeEvent(type, data, timestamp) {
+    const entry = { type, timestamp: timestamp ?? new Date().toISOString(), data };
     const jsonl = JSON.stringify(entry) + "\n";
-    if (eventsStream) {
-      eventsStream.write(jsonl);
+    if (eventsStream && !eventsStreamError) {
+      try {
+        if (eventsStream.destroyed || eventsStream.writableEnded) throw new Error("SDK events stream closed before event serialization");
+        eventsStream.write(jsonl);
+      } catch (err) {
+        recordEventsStreamError(err);
+      }
     }
     process.stderr.write(jsonl);
   }
@@ -240,6 +278,7 @@ async function runWithCopilotSDK({
    * @param {string} reason
    */
   function recordToolDenial(reason) {
+    if (shuttingDown) return;
     toolDenialCount += 1;
     log(`tool denial ${toolDenialCount}/${maxToolDenialsLimit}: ${reason}`);
     if (catastrophicToolDenialsTriggered || toolDenialCount < maxToolDenialsLimit) {
@@ -247,16 +286,15 @@ async function runWithCopilotSDK({
     }
     catastrophicToolDenialsTriggered = true;
     catastrophicToolDenialsError = new Error(`max tool denials threshold reached (${toolDenialCount}/${maxToolDenialsLimit})`);
-    writeDriverEvent("guard.tool_denials_exceeded", {
-      denialCount: toolDenialCount,
-      threshold: maxToolDenialsLimit,
-      reason,
-    });
-    log(`${catastrophicToolDenialsError.message}; stopping SDK session early`);
-    if (session) {
-      void session.disconnect().catch(() => {
-        // best-effort early stop
+    try {
+      writeEvent("guard.tool_denials_exceeded", {
+        denialCount: toolDenialCount,
+        threshold: maxToolDenialsLimit,
+        reason,
       });
+      log(`${catastrophicToolDenialsError.message}; stopping SDK session early`);
+    } finally {
+      signalSessionTermination(catastrophicToolDenialsError);
     }
   }
 
@@ -294,29 +332,13 @@ async function runWithCopilotSDK({
     fs.mkdirSync(sessionDir, { recursive: true });
     const eventsPath = path.join(sessionDir, "events.jsonl");
     eventsStream = fs.createWriteStream(eventsPath, { flags: "a" });
-    // Snapshot to a non-null local for closure-safe writes (JSDoc nullability narrowing).
-    const stream = eventsStream;
+    eventsStream.on("error", recordEventsStreamError);
     log(`serialising SDK events to ${eventsPath}`);
 
-    /**
-     * Write one JSONL entry to the events file and stderr.
-     * Uses the event's own ISO-8601 timestamp when available.
-     *
-     * @param {string} type
-     * @param {any} data
-     * @param {string | undefined} [timestamp]
-     */
-    function writeEvent(type, data, timestamp) {
-      const entry = { type, timestamp: timestamp ?? new Date().toISOString(), data };
-      const jsonl = JSON.stringify(entry) + "\n";
-      stream.write(jsonl);
-      process.stderr.write(jsonl);
-    }
-
     // Subscribe to all session events and serialise the ones we care about.
-    session.on(event => {
+    unsubscribe = session.on(event => {
       // Skip transient events that are not persisted by the server.
-      if (event.ephemeral) return;
+      if (shuttingDown || catastrophicToolDenialsTriggered || eventsStreamError || event.ephemeral) return;
 
       switch (event.type) {
         case "user.message":
@@ -425,19 +447,17 @@ async function runWithCopilotSDK({
       //   tool call was just started, LLM inference is in progress, or no output yet).
       // The watchdog fires only if sendAndWait never resolves on its own after
       // the final tool result is returned — the common SDK post-completion hang.
-      if (hasOutput && pendingToolCalls.size === 0 && !inAssistantTurn) {
+      if (!shuttingDown && !catastrophicToolDenialsTriggered && !eventsStreamError && hasOutput && pendingToolCalls.size === 0 && !inAssistantTurn) {
         if (postCompletionWatchdog) clearTimeout(postCompletionWatchdog);
         postCompletionWatchdog = setTimeout(() => {
           postCompletionWatchdog = null;
           // Re-check conditions at fire time: a new tool call could have started
           // or a new turn could have begun between arming the watchdog and the
           // timer firing (race condition guard).
-          if (!hasOutput || pendingToolCalls.size !== 0 || inAssistantTurn || !session) return;
+          if (shuttingDown || catastrophicToolDenialsTriggered || eventsStreamError || !hasOutput || pendingToolCalls.size !== 0 || inAssistantTurn || !session) return;
           log(`warning: post-completion idle watchdog fired after ${postCompletionIdleMs}ms — force-disconnecting session`);
           postCompletionWatchdogTriggered = true;
-          void session.disconnect().catch(err => {
-            log(`warning: post-completion watchdog disconnect failed: ${getErrorMessage(err)}`);
-          });
+          signalSessionTermination(new Error(`post-completion idle watchdog fired after ${postCompletionIdleMs}ms`));
         }, postCompletionIdleMs);
       } else {
         if (postCompletionWatchdog) {
@@ -449,10 +469,17 @@ async function runWithCopilotSDK({
 
     log("sending prompt...");
     const sendTimeoutMs = getEnvPositiveIntOrDefault("COPILOT_SDK_SEND_TIMEOUT_MS", SDK_SEND_TIMEOUT_MS_DEFAULT);
-    const result = await session.sendAndWait({ prompt }, sendTimeoutMs);
+    // Promise.race observes the losing send's eventual rejection as well.
+    const result = await Promise.race([session.sendAndWait({ prompt }, sendTimeoutMs), sessionTermination]);
 
     if (catastrophicToolDenialsError) {
       throw catastrophicToolDenialsError;
+    }
+    if (eventsStreamError) {
+      throw eventsStreamError;
+    }
+    if (result instanceof Error) {
+      throw result;
     }
 
     // sendAndWait returns the last assistant.message event; capture its content
@@ -466,105 +493,119 @@ async function runWithCopilotSDK({
       }
     }
 
-    const durationMs = Date.now() - startTime;
+    durationMs = Date.now() - startTime;
     log(`session completed: hasOutput=${hasOutput} assistantTurns=${assistantTurnCount} durationMs=${durationMs}`);
-
-    return { exitCode: 0, output, hasOutput, durationMs };
+    exitCode = 0;
   } catch (err) {
-    const durationMs = Date.now() - startTime;
-    const failure = catastrophicToolDenialsError ?? (err instanceof Error ? err : new Error(String(err)));
+    durationMs = Date.now() - startTime;
+    failure = catastrophicToolDenialsError ?? eventsStreamError ?? (err instanceof Error ? err : new Error(String(err)));
     log(`error: ${failure.message}`);
 
-    // When the post-completion idle watchdog force-disconnected the session, the
+    // When the post-completion idle watchdog ends the send wait, the
     // agent's work is done — the SDK simply failed to resolve sendAndWait after
     // the final tool result was returned.  Treat it as a successful completion.
-    if (postCompletionWatchdogTriggered && !catastrophicToolDenialsError && hasOutput && pendingToolCalls.size === 0) {
+    const isIdleTimeout = !catastrophicToolDenialsError && !eventsStreamError && SDK_IDLE_TIMEOUT_PATTERN.test(failure.message);
+    if (postCompletionWatchdogTriggered && !catastrophicToolDenialsError && !eventsStreamError && hasOutput && pendingToolCalls.size === 0) {
       log(`warning: post-completion watchdog triggered disconnect — treating as completed`);
       log(`session completed: hasOutput=${hasOutput} assistantTurns=${assistantTurnCount} durationMs=${durationMs}`);
-      return { exitCode: 0, output, hasOutput, durationMs };
-    }
-
-    // When sendAndWait times out waiting for session.idle but the agent produced
-    // output and all tracked tool calls have already completed, the session work is
-    // done — the SDK simply failed to emit the idle signal.  Treat it as a successful
-    // run so the harness does not classify it as a failure or waste retry attempts.
-    const isIdleTimeout = !catastrophicToolDenialsError && SDK_IDLE_TIMEOUT_PATTERN.test(failure.message);
-    if (isIdleTimeout && hasOutput && pendingToolCalls.size === 0) {
+      exitCode = 0;
+    } else if (isIdleTimeout && hasOutput && pendingToolCalls.size === 0) {
+      // A missing session.idle is recoverable only without a fatal driver error.
       log(`warning: SDK idle-timeout with collected output and no pending tool calls — treating as completed`);
       log(`session completed: hasOutput=${hasOutput} assistantTurns=${assistantTurnCount} durationMs=${durationMs}`);
-      return { exitCode: 0, output, hasOutput, durationMs };
+      exitCode = 0;
     }
-
-    // Preserve any output collected before the error so the harness can use it
-    // for retry decisions and diagnostics.
-    return {
-      exitCode: 1,
-      output: hasOutput ? output : failure.message,
-      hasOutput,
-      durationMs,
-    };
   } finally {
+    shuttingDown = true;
     // Clear the post-completion watchdog if it has not already fired.
     if (postCompletionWatchdog) {
       clearTimeout(postCompletionWatchdog);
       postCompletionWatchdog = null;
     }
-    // Snapshot for null-safe cleanup in this scope.
-    const stream = eventsStream;
-    if (stream) {
-      await new Promise(resolve => stream.end(resolve));
+    if (typeof unsubscribe === "function") {
+      try {
+        unsubscribe();
+      } catch (err) {
+        log(`warning: session event listener cleanup failed: ${getErrorMessage(err)}`);
+      }
     }
-    // Timeout budget for each cleanup operation.  Prevents the driver from
-    // hanging indefinitely when the server is unresponsive after sendAndWait
-    // times out or the watchdog force-disconnects the session.
-    // The helper resolves normally on success and also on timeout (signalling
-    // timeout via the returned boolean) so the caller can log a warning.
     const CLEANUP_TIMEOUT_MS = 5_000;
     /**
-     * Race a cleanup promise against a fixed deadline.
-     * Resolves to true when the promise settled in time, false on timeout.
-     * @param {Promise<unknown>} p
+     * Observe throws and late rejections without skipping subsequent cleanup.
+     * Return false on failure or timeout, true on successful cleanup.
+     * @param {string} label
+     * @param {() => unknown} cleanup
      * @returns {Promise<boolean>}
      */
-    const withCleanupTimeout = p => {
-      /** @type {any} */
+    const withCleanupTimeout = async (label, cleanup) => {
+      /** @type {ReturnType<typeof setTimeout> | null} */
       let timeoutId = null;
+      let timedOut = false;
+      /** @type {Promise<boolean>} */
       const deadline = new Promise(resolve => {
+        // Pending promises cannot keep Node alive; this deadline must stay referenced.
         timeoutId = setTimeout(() => {
-          timeoutId = null;
+          timedOut = true;
           resolve(false);
         }, CLEANUP_TIMEOUT_MS);
-        if (typeof timeoutId?.unref === "function") timeoutId.unref();
       });
-      return Promise.race([
-        p.then(
-          () => true,
-          () => true
-        ),
-        deadline,
-      ]).then(settled => {
-        if (timeoutId) clearTimeout(timeoutId);
-        if (!settled) {
-          log(`warning: cleanup operation timed out after ${CLEANUP_TIMEOUT_MS}ms`);
+      try {
+        const settled = await Promise.race([
+          Promise.resolve()
+            .then(cleanup)
+            .then(
+              () => true,
+              err => {
+                log(`warning: ${label} cleanup failed: ${getErrorMessage(err)}`);
+                return false;
+              }
+            ),
+          deadline,
+        ]);
+        if (timedOut) {
+          log(`warning: cleanup operation timed out after ${CLEANUP_TIMEOUT_MS}ms (${label})`);
         }
         return settled;
-      });
-    };
-    if (session) {
-      try {
-        await withCleanupTimeout(session.disconnect());
-      } catch {
-        // best-effort cleanup
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
       }
+    };
+    const stream = eventsStream;
+    if (stream) {
+      const drained = await withCleanupTimeout("events stream", async () => {
+        try {
+          await finished(stream.end(), { cleanup: true });
+        } catch (err) {
+          recordEventsStreamError(err);
+          throw err;
+        }
+      });
+      if (!drained && !eventsStreamError) {
+        recordEventsStreamError(new Error("SDK events stream did not finish during cleanup"));
+      }
+      if (!drained) {
+        try {
+          stream.destroy();
+        } catch (err) {
+          recordEventsStreamError(err);
+        }
+      }
+    }
+    if (session) {
+      await withCleanupTimeout("session.disconnect", () => session.disconnect());
     }
     if (clientStarted) {
-      try {
-        await withCleanupTimeout(client.stop());
-      } catch {
-        // best-effort cleanup
-      }
+      await withCleanupTimeout("client.stop", () => client.stop());
     }
   }
+
+  // A stream failure during cleanup must not freeze an earlier success result.
+  const terminalFailure = catastrophicToolDenialsError ?? eventsStreamError;
+  if (terminalFailure) {
+    exitCode = 1;
+    failure = terminalFailure;
+  }
+  return { exitCode, output: hasOutput ? output : (failure?.message ?? output), hasOutput, durationMs };
 }
 
 module.exports = { SDK_SEND_TIMEOUT_MS_DEFAULT, SDK_POST_COMPLETION_IDLE_MS_DEFAULT, SDK_IDLE_TIMEOUT_PATTERN, extractPromptFromArgs, runWithCopilotSDK };

@@ -7,7 +7,7 @@ sidebar:
 
 # Copilot SDK Driver Specification
 
-**Version**: 1.0.2  
+**Version**: 1.0.3\
 **Status**: Draft Specification  
 **Latest Version**: [copilot-sdk-driver-specification](/gh-aw/specs/copilot-sdk-driver-specification/)  
 **Editor**: GitHub Agentic Workflows Team
@@ -188,7 +188,9 @@ inference once the configured threshold is reached. When unset,
 non-numeric, or non-positive, implementations MUST apply the default
 value (`5`).
 
-This counting requirement tightens the specification to match the existing gh-aw reference implementation in `actions/setup/js/copilot_sdk_session.cjs` and the current `copilot_sdk_driver.test.cjs` guardrail coverage. It does not change gh-aw runtime behavior, but implementations that previously treated denial counting as optional would need to align with this clarified conformance requirement.
+Reaching the threshold MUST settle the driver with a non-zero result independently of the in-flight SDK request. Requesting disconnection alone is insufficient: the driver MUST enter bounded cleanup even if `sendAndWait` never settles. Previously received assistant output MUST NOT turn this driver-level guard failure into success.
+
+The driver MUST preserve the `guard.tool_denials_exceeded` event and its `denialCount`, `threshold`, and `reason` fields for failure reporting. The guard MUST fire at most once per session. Ordinary tool execution failures that are not permission denials MUST NOT increment the counter.
 
 ### 4.6 TypeScript Example (Non-Normative)
 
@@ -280,9 +282,16 @@ When scoped rules are active, the implementation MUST evaluate requests as follo
 
 For `shell(<rule>)` entries:
 
-- Rules ending with `:*` MUST perform prefix matching against command identifiers.
-- Rules without spaces SHOULD be treated as identifier matches.
-- Rules containing spaces MUST be treated as exact full-command matches.
+- Rules ending with `:*` and containing only an executable name retain identifier matching.
+- Multiword prefixes before `:*`, such as `git checkout`, MUST match complete command tokens at the beginning of a command, with optional additional arguments. `git checkout:*` MUST NOT authorize `git checkout-other` or `git push`.
+- Subcommand-scoped matching MUST use full command text whether SDK identifiers contain an executable name, the complete command, or no entries.
+- For chained or piped commands authorized through subcommand-scoped matching, every command segment MUST match an applicable grant. Repeated executable names MUST NOT be deduplicated before checking their subcommands.
+- Quoted argument text MUST NOT be mistaken for a command separator. Unsupported or malformed shell syntax MUST NOT authorize a request through a subcommand-scoped grant.
+- Literal Git revision arguments such as `HEAD~1` and `HEAD@{1}` MUST NOT be rejected as shell expansions.
+- Rules without `:*` or spaces SHOULD be treated as identifier matches.
+- Rules containing spaces but not ending with `:*` MUST remain exact full-command matches, not implicit argument wildcards or grants for individual chain segments.
+
+These rules do not broaden a subcommand grant into an executable-wide grant. Explicit unrestricted shell grants and exact full-command grants retain their existing semantics.
 
 ### 5.5 Rejection Contract
 
@@ -387,6 +396,12 @@ The session result object SHOULD include:
 
 The implementation MUST perform best-effort cleanup of event streams, session handles, and client handles regardless of success or failure.
 
+Cleanup after the tool-denials guard MUST have a finite deadline for each operation, including event-stream draining, session disconnection, and client shutdown. A stalled or rejected cleanup operation MUST NOT prevent the remaining cleanup operations or replace the original guard failure. Late SDK events MUST NOT write to a closed event stream or restart session watchdogs.
+
+The reference implementation allows up to five seconds for each of these three sequential cleanup operations. Its cleanup wait is therefore bounded by fifteen seconds, excluding event-loop scheduling delays. Cleanup deadline timers remain active until their operation settles or times out so the standalone driver can reach its explicit non-zero exit even when no other SDK handles remain.
+
+This driver contract does not change the host harness's existing recovery policy for previously completed safe outputs.
+
 ---
 
 ## 8. Compliance Testing
@@ -419,8 +434,16 @@ Implementations MUST provide automated tests for all Level 1 and Level 2 require
 - **T-CSD-109**: Scoped allowlist enforces shell matching for `shell`, `shell(<rule>)`, and exact full-command entries.
 - **T-CSD-110**: Unknown request kinds are rejected.
 - **T-CSD-111**: Rejected requests include policy feedback and denial logs.
+- **T-CSD-112**: Subcommand-scoped grants approve the same permitted commands with executable-only, full-command, and absent SDK identifiers.
+- **T-CSD-113**: Subcommand boundaries, repeated executables in chains, and unsupported syntax cannot authorize an ungranted command.
 
-#### 8.1.3 Logging Tests
+#### 8.1.3 Guard and Cleanup Tests
+
+- **T-CSD-114**: Reaching the denial threshold produces one guard event and a non-zero driver result even if `sendAndWait` remains pending.
+- **T-CSD-115**: Stalled or rejected cleanup operations complete within their deadlines without masking the guard failure or causing unhandled late rejections.
+- **T-CSD-116**: The standalone driver exits non-zero within the cleanup budget and preserves the guard event in session logs.
+
+#### 8.1.4 Logging Tests
 
 - **T-CSD-201**: Lifecycle logs include connection, session, prompt, completion, and failure markers.
 - **T-CSD-202**: Permission denial logs include compact request summary.
@@ -440,6 +463,8 @@ Implementations MUST provide automated tests for all Level 1 and Level 2 require
 | Scoped MCP/shell enforcement                  | T-CSD-108..109       | 2     | Required    |
 | Unknown-kind rejection                        | T-CSD-110            | 2     | Required    |
 | Permission denial diagnostics                 | T-CSD-111, T-CSD-202 | 2     | Required    |
+| Subcommand-scoped shell authorization          | T-CSD-112..113       | 2     | Required    |
+| Bounded denial-guard termination               | T-CSD-114..116       | 1     | Required    |
 | Lifecycle logging coverage                    | T-CSD-201            | 3     | Recommended |
 
 ---
@@ -450,6 +475,7 @@ Implementations MUST provide automated tests for all Level 1 and Level 2 require
 
 - `shell` authorizes all shell requests.
 - `shell(git:*)` authorizes shell commands whose identifier begins with `git`.
+- `shell(git checkout:*)` authorizes `git checkout -b topic`, but not `git push` or a checkout chain containing an ungranted command.
 - `github(get_file_contents)` authorizes only one MCP tool on one MCP server.
 - `github` authorizes all tools on the `github` MCP server.
 - `web_fetch` authorizes URL requests.
@@ -505,8 +531,10 @@ The canonical gh-aw implementation for this specification is centered in:
 
 - `actions/setup/js/copilot_sdk_driver.cjs`
 - `actions/setup/js/copilot_sdk_session.cjs`
+- `actions/setup/js/copilot_sdk_permissions.cjs`
 - `actions/setup/js/copilot_harness.cjs`
 - `actions/setup/js/copilot_sdk_driver.test.cjs`
+- `actions/setup/js/copilot_sdk_permissions.test.cjs`
 
 This specification MUST be revalidated whenever any of the following occurs:
 
@@ -518,6 +546,12 @@ This specification MUST be revalidated whenever any of the following occurs:
 
 <a id="change-log"></a>
 ## Change Log
+
+### Version 1.0.3 (Draft Specification)
+
+- Clarified command-token matching and all-segment authorization for subcommand-scoped shell grants.
+- Required independent denial-guard termination and bounded cleanup, with regression coverage for stalled SDK operations.
+- Preserved the existing host harness publication and recovery policy.
 
 ### Version 1.0.2 (Draft Specification)
 

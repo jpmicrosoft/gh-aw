@@ -7,7 +7,7 @@ sidebar:
 
 # Bash Command Parser Specification
 
-**Version**: 1.1.0  
+**Version**: 1.1.1\
 **Status**: Draft Specification  
 **Latest Version**: [bash-command-parser-specification](/gh-aw/specs/bash-command-parser-specification/)  
 **Editors**: GitHub Agentic Workflows Team
@@ -194,12 +194,16 @@ letter         = "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J"
 
 ## 5. Driver Integration Semantics
 
-The parser output is consumed by fallback shell-permission logic:
+The executable-name parser output is consumed by fallback shell-permission logic:
 
 1. If multiple names are extracted (`length > 1`), **all** names MUST satisfy shell identifier rules.
 2. If one name is extracted (`length === 1`), normal single-command matching applies, including exact full-command matching for literal shell rules that contain spaces (for example `ls /tmp`).
 3. If no names are extracted (`length === 0`), only exact full-command matching for shell rules that contain spaces is attempted; otherwise deny.
 4. This preserves default-deny behavior when parsing cannot confidently identify commands.
+
+Subcommand-scoped grants, such as `shell(git checkout:*)`, require a separate segment-preserving parse of full command text. A deduplicated list containing only `git` cannot distinguish an allowed checkout from an ungranted push in the same chain. Consumers MUST retain command tokens and segment order, check complete token prefixes, and authorize every segment independently of SDK-provided executable identifiers.
+
+This scoped path MUST reject unsupported execution-bearing syntax and malformed input rather than relying on the legacy extractor's tolerant behavior. Quoted literal arguments remain distinct from command separators. These additional permission checks do not change the splitter, extractor, or deduplication contracts in Section 4. See [Shell Rule Semantics](/gh-aw/specs/copilot-sdk-driver-specification/#54-shell-rule-semantics) for the authorization contract.
 
 ---
 
@@ -350,10 +354,12 @@ The following MUST-level norms apply to all Class I (Integration Consumer) confo
 
 The canonical machine-readable vector collection for this specification is `specs/test-vectors/bash-command-parser/`.
 
-For version `1.1.0`, the canonical seed files are:
+The legacy splitter and extractor compatibility corpus remains:
 
 - `specs/test-vectors/bash-command-parser/v1.1.0-model-based.json`
 - `specs/test-vectors/bash-command-parser/v1.1.0-verification.json`
+
+Subcommand-scoped authorization is additionally covered by `actions/setup/js/copilot_sdk_permissions.test.cjs`.
 
 These vectors MUST be revalidated whenever either of the following occurs:
 
@@ -364,6 +370,11 @@ These vectors MUST be revalidated whenever either of the following occurs:
 
 <a id="change-log"></a>
 ## Change Log
+
+### Version 1.1.1 (Scoped-permission integration)
+
+- Distinguished segment-preserving subcommand authorization from deduplicated executable-name extraction.
+- Retained the existing legacy parser contracts and version 1.1.0 compatibility vectors.
 
 ### Version 1.1.0 (2026-07-06 maintenance update)
 

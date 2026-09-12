@@ -12,7 +12,7 @@ import { describe, it, expect } from "vitest";
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
-const { splitOnPipelineOperators, extractCommandName, extractCommandNamesFromPipeline } = require("./bash_command_parser.cjs");
+const { splitOnPipelineOperators, extractCommandName, extractCommandNamesFromPipeline, parseShellCommandSegments } = require("./bash_command_parser.cjs");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // splitOnPipelineOperators
@@ -481,5 +481,137 @@ describe("extractCommandNamesFromPipeline – extensive vectors", () => {
     },
   ])("matches vector $id", ({ input, expected }) => {
     expect(extractCommandNamesFromPipeline(input)).toEqual(expected);
+  });
+});
+
+describe("parseShellCommandSegments", () => {
+  it.each([
+    { input: "git checkout -b automation/repro", expected: [["git", "checkout", "-b", "automation/repro"]] },
+    { input: "git checkout HEAD~1", expected: [["git", "checkout", "HEAD~1"]] },
+    { input: "git checkout HEAD@{1}", expected: [["git", "checkout", "HEAD@{1}"]] },
+    { input: "git branch topic HEAD~1", expected: [["git", "branch", "topic", "HEAD~1"]] },
+    { input: "git checkout @{-1}", expected: [["git", "checkout", "@{-1}"]] },
+    { input: 'git checkout {a","b}', expected: [["git", "checkout", "{a,b}"]] },
+    { input: 'git checkout {1.."3"}', expected: [["git", "checkout", "{1..3}"]] },
+    { input: "git\tbranch\t--show-current", expected: [["git", "branch", "--show-current"]] },
+    { input: "'git' \"checkout\" a", expected: [["git", "checkout", "a"]] },
+    { input: "g\"it\" ch'eck'out", expected: [["git", "checkout"]] },
+    { input: '"git checkout" a', expected: [["git checkout", "a"]] },
+    { input: "git checkout -- 'a;b&c.txt'", expected: [["git", "checkout", "--", "a;b&c.txt"]] },
+    { input: 'git checkout -- "a;b&c.txt"', expected: [["git", "checkout", "--", "a;b&c.txt"]] },
+    { input: "git checkout -- a\\;b\\&c.txt", expected: [["git", "checkout", "--", "a;b&c.txt"]] },
+    { input: "git checkout -- '$(git push)'", expected: [["git", "checkout", "--", "$(git push)"]] },
+    { input: "git checkout -- '`git push`'", expected: [["git", "checkout", "--", "`git push`"]] },
+    { input: 'git checkout -- "\\$(git push)"', expected: [["git", "checkout", "--", "$(git push)"]] },
+    { input: 'git checkout -- "a\\qb"', expected: [["git", "checkout", "--", "a\\qb"]] },
+    { input: 'git checkout ""', expected: [["git", "checkout", ""]] },
+    { input: "git checkout 2>&1", expected: [["git", "checkout"]] },
+    { input: "git 2>&1 checkout >out.txt", expected: [["git", "checkout"]] },
+    { input: "git checkout>out.txt 2>>errors.txt <input.txt", expected: [["git", "checkout"]] },
+    {
+      input: "git checkout 2>&1&&git branch",
+      expected: [
+        ["git", "checkout"],
+        ["git", "branch"],
+      ],
+    },
+    { input: "git checkout \\\n  -b automation/repro", expected: [["git", "checkout", "-b", "automation/repro"]] },
+    { input: "git checkout \\\r\n  -b automation/repro", expected: [["git", "checkout", "-b", "automation/repro"]] },
+    { input: "g\\\nit ch\\\neckout", expected: [["git", "checkout"]] },
+    { input: "git\\\ncheckout", expected: [["gitcheckout"]] },
+    { input: "\n git checkout\r\n\r\n", expected: [["git", "checkout"]] },
+    {
+      input: "git checkout &&\r\n git branch",
+      expected: [
+        ["git", "checkout"],
+        ["git", "branch"],
+      ],
+    },
+  ])("preserves literal tokens and segment boundaries for $input", ({ input, expected }) => {
+    expect(parseShellCommandSegments(input)).toEqual(expected);
+  });
+
+  it.each(["&&", "||", "|", ";", "\n", "\r\n", "\r"])("retains repeated executables around %j", separator => {
+    expect(parseShellCommandSegments(`git checkout a ${separator} git push ${separator} git checkout b`)).toEqual([
+      ["git", "checkout", "a"],
+      ["git", "push"],
+      ["git", "checkout", "b"],
+    ]);
+  });
+
+  it.each([
+    "",
+    " \t\r\n ",
+    "&&",
+    "git checkout &&",
+    "git checkout &&\r\n",
+    "git checkout ||",
+    "git checkout |",
+    "git checkout;",
+    "git checkout && ; git branch",
+    "git checkout;;;git branch",
+    "git checkout & git branch",
+    "git checkout 2>&1 & git branch",
+    "git checkout |& git branch",
+    "git checkout 'unclosed",
+    'git checkout "unclosed',
+    "git checkout trailing\\",
+    "git checkout $(git push)",
+    'git checkout "$(git push)"',
+    'git checkout "$(echo $(git push))"',
+    "git checkout `git push`",
+    'git checkout "`git push`"',
+    "git checkout <(git push)",
+    "git checkout >(git push)",
+    "git checkout <<EOF\ngit push\nEOF",
+    'git checkout <<< "literal"',
+    "git checkout >",
+    "git checkout 2>&",
+    "git checkout 2>&1x",
+    "git checkout >>>out.txt",
+    ">out.txt git checkout",
+    "if git checkout; then git branch; fi",
+    "{ git checkout; git branch; }",
+    "(git checkout)",
+    "git checkout && fi",
+    "git checkout && NAME=value",
+    "NAME=value git checkout",
+    '"" git checkout',
+    "git checkout # comment",
+    "git checkout $branch",
+    "git checkout ${branch}",
+    "git checkout *",
+    "git checkout ~",
+    "git checkout name=~",
+    "git checkout name=x:~",
+    "git check{out,-ref}",
+    "git checkout {topic,other}",
+    "git checkout topic{1..3}",
+    "git checkout {a..z}",
+    "git checkout {3..1..-1}",
+    "git checkout {+1..+3..+1}",
+    "git checkout {1.\\\n.3}",
+    "git checkout {nested,{topic,other}}",
+    "git checkout {nested,{1..3}}",
+    "{ git checkout",
+    "git checkout && }",
+    "git checkout \0",
+  ])("returns null, never partial or empty commands, for %j", input => {
+    expect(parseShellCommandSegments(input)).toBeNull();
+  });
+
+  it.each([{ input: undefined }, { input: null }, { input: 42 }, { input: ["git checkout"] }, { input: { toString: () => "git checkout" } }])("rejects non-string input $input", ({ input }) => {
+    expect(parseShellCommandSegments(input)).toBeNull();
+  });
+
+  it("can disallow redirections when parsing a scoped rule prefix", () => {
+    expect(parseShellCommandSegments("git checkout >out.txt", { allowRedirections: false })).toBeNull();
+    expect(parseShellCommandSegments("git checkout 2>&1", { allowRedirections: false })).toBeNull();
+    expect(parseShellCommandSegments("git checkout 'a>b'", { allowRedirections: false })).toEqual([["git", "checkout", "a>b"]]);
+  });
+
+  it.each(["git checkout 'unclosed", "git checkout &&", "git checkout $(git push)", "git checkout && fi"])("does not change legacy extractor tolerance for %s", input => {
+    expect(extractCommandNamesFromPipeline(input)).toEqual(["git"]);
+    expect(parseShellCommandSegments(input)).toBeNull();
   });
 });
