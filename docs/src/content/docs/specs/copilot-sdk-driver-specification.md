@@ -345,7 +345,10 @@ MUST fail before inference.
 
 Native MCP configuration MUST be bound explicitly to the SDK session. Only
 gateway HTTP/SSE definitions are accepted; subprocess servers and credential
-logging are forbidden. Catalog initialization MAY temporarily select MCP tools
+logging are forbidden. The dedicated safe-outputs bundle MUST include all local
+module dependencies; startup coverage must load that isolated bundle rather than
+rely on files available only in the full source tree.
+Catalog initialization MAY temporarily select MCP tools
 for metadata discovery, but MUST replace that selection with concrete,
 source-qualified names before inference. The driver MUST verify the resulting
 catalog and fence late initialization continuations after timeout or cancellation.
