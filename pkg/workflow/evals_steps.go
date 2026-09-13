@@ -169,6 +169,7 @@ func (c *Compiler) buildEvalsEngineSteps(data *WorkflowData) []string { //nolint
 		copy := *data.EngineConfig
 		evalsEngineConfig = &copy
 		evalsEngineConfig.Agent = ""
+		evalsEngineConfig.ToolProfile = ""
 		if evalsEngineConfig.ID == "" {
 			evalsEngineConfig.ID = engineID
 		}
