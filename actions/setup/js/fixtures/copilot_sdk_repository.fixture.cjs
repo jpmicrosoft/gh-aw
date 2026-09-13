@@ -8,6 +8,7 @@ const path = require("node:path");
 const { randomUUID } = require("node:crypto");
 const { execFileSync } = require("node:child_process");
 const { createRequire } = require("node:module");
+const { copySafeOutputsBundle } = require("./safeoutputs_bundle.fixture.cjs");
 
 const runtimeDirectory = path.resolve(__dirname, "..");
 const load = createRequire(path.join(runtimeDirectory, "copilot_sdk_session.cjs"));
@@ -24,6 +25,9 @@ const root = path.join(scratch, "checkout");
 const home = path.join(scratch, "home");
 const sdkHome = path.join(scratch, "sdk-home");
 for (const directory of [root, home, sdkHome]) fs.mkdirSync(directory);
+const safeOutputsBundle = path.join(scratch, "safeoutputs-bundle");
+copySafeOutputsBundle(safeOutputsBundle);
+const loadSafeOutputs = createRequire(path.join(safeOutputsBundle, "safe_outputs_mcp_server_http.cjs"));
 fs.mkdirSync(path.join(root, "docs"));
 const branch = `automation/sdk-${randomUUID()}`;
 const artifacts = [getPatchPathForBranch(branch), getPatchPathForBranchInRepo(branch, "fixture/repository")].map(filename => path.resolve(filename));
@@ -92,7 +96,7 @@ Object.assign(process.env, minimalEnv, {
 
 async function main() {
   const { MCPServer, MCPHTTPTransport } = load("./mcp_http_transport.cjs");
-  const { createMCPServer } = load("./safe_outputs_mcp_server_http.cjs");
+  const { createMCPServer } = loadSafeOutputs("./safe_outputs_mcp_server_http.cjs");
   const safeoutputs = createMCPServer().server;
   const github = new MCPServer({ name: "github", version: "1.0.0" }, { logDir: path.join(scratch, "mcp-logs") });
   let reads = 0;

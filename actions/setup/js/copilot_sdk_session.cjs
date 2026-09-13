@@ -490,7 +490,6 @@ async function runWithCopilotSDK({
       }
     });
 
-    log("sending prompt...");
     const sendTimeoutMs = getEnvPositiveIntOrDefault("COPILOT_SDK_SEND_TIMEOUT_MS", SDK_SEND_TIMEOUT_MS_DEFAULT);
     // Promise.race observes the losing send's eventual rejection as well.
     if (toolConfig?.profile) {
@@ -504,6 +503,7 @@ async function runWithCopilotSDK({
       verifiedToolMetadata = catalog;
       log(`verified no-shell repository catalog: ${catalog.length} native tools`);
     }
+    log("sending prompt...");
     const result = await Promise.race([session.sendAndWait({ prompt }, sendTimeoutMs), sessionTermination]);
 
     if (catastrophicToolDenialsError) {
