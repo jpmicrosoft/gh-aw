@@ -113,6 +113,10 @@ A conforming implementation MUST execute the following sequence:
 6. Return success/failure result.
 7. Perform best-effort cleanup of stream/session/client resources.
 
+An opt-in repository profile MUST initialize its owned repository context before
+creating the model session and verify its concrete native tool catalog before
+step 5. A failed initialization MUST NOT send a model prompt.
+
 ### 3.3 Event Persistence
 
 A complete implementation (Level 3) SHOULD serialize non-ephemeral session events to a JSON Lines stream compatible with downstream timeline rendering.
@@ -146,6 +150,9 @@ In standalone mode, the implementation MUST enforce the following contract:
 | `GH_AW_MAX_TOOL_DENIALS`      | No       | Maximum repeated tool denials before aborting inference | Input SHOULD be a positive integer; default `5`; implementations MUST fall back on invalid values |
 | `COPILOT_SDK_LOG_LEVEL`       | No       | SDK client log level                                      | gh-aw may set this for driver runtime logging; valid values: `none`, `error`, `warning`, `info`, `debug`, `all`; invalid values MUST fall back to `warning` |
 | `GITHUB_WORKSPACE`            | No       | Working directory hint                                    | SHOULD be used when present                                                                                  |
+| `GH_AW_COPILOT_SDK_TOOL_CONFIG` | Yes | Compiler-owned tool and permission JSON | Version 1 for ordinary SDK workflows; version 2 for `go-repository`. Missing or inconsistent contracts MUST fail before session creation. |
+| `GH_AW_MCP_CONFIG` | With MCP capability | Converted gateway MCP configuration | MUST name a regular file of at most 1 MiB. SDK execution stages it at `${RUNNER_TEMP}/gh-aw/mcp-config/copilot-sdk.json` before entering AWF. |
+| `GITHUB_REPOSITORY`, `GITHUB_SHA` | With `go-repository` | Trusted checkout identity and publication baseline | The root checkout MUST match the current repository and starting SHA; `GITHUB_WORKSPACE` is also required for this profile. |
 
 > **Note**: Platform authentication tokens (`GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`) are NOT available in the SDK driver subprocess environment. Driver implementations MUST NOT reference or depend on these variables.
 
@@ -254,12 +261,15 @@ The driver MUST always configure an `onPermissionRequest` handler when creating
 an SDK session. The handler MUST consume the effective permission configuration
 input and resolve as follows:
 
-1. If `allowAllTools` is `true`, the driver MUST approve all permission requests.
-2. If effective permission configuration is absent, the driver MUST treat the
-   session as unrestricted and approve all permission requests.
-3. If `allowedTools` is empty after normalization, the driver MUST treat the
-   session as unrestricted and approve all permission requests.
-4. Otherwise, the driver MUST enforce the scoped allow rules below.
+1. Standalone compiled workflows MUST obtain a nonempty permission allowlist
+   from the validated compiler-owned tool contract.
+2. Missing, malformed, or contradictory standalone contracts MUST fail closed;
+   they MUST NOT fall back to unrestricted tools.
+3. The driver MUST enforce the scoped allow rules below.
+
+The reusable permission helper retains its legacy explicit allow-all and
+missing/empty-configuration behavior for embedded callers. That API compatibility
+does not authorize a standalone workflow to omit its compiler contract.
 
 ### 5.3 Scoped Allow Rules
 
@@ -271,7 +281,7 @@ When scoped rules are active, the implementation MUST evaluate requests as follo
 - `custom-tool`: MUST be approved only when `allowedTools` contains the request tool name.
 - `mcp`: MUST be approved when either:
   - `allowedTools` contains `<serverName>`, or
-  - `allowedTools` contains `<serverName>(<toolName>)`.
+  - `allowedTools` contains `<serverName>(<rawMCPToolName>)`.
 - `shell`: MUST be approved when at least one condition is true:
   - `allowedTools` contains `shell`.
   - A `shell(<rule>)` entry matches the request command identifier.
@@ -310,6 +320,82 @@ export function canUseWriteTool(config: PermissionConfig): boolean {
   return (config.allowedTools ?? []).includes("write");
 }
 ```
+
+### 5.7 Go Repository Profile
+
+`engine.tool-profile: go-repository` is an opt-in version 2 contract for the
+bundled Copilot SDK driver inside AWF. It MUST preserve explicit `bash: false`
+and `cli-proxy: false`, keep editing enabled, and register the exact custom
+permission `go_repository`. Version 1 defaults remain unchanged when the
+profile is omitted, except that `write_bash` MUST NOT be exposed through editing
+when Bash is disabled.
+
+Profile SDK dependencies are installed under
+`${RUNNER_TEMP}/gh-aw/copilot-sdk`, outside the reviewed checkout and inside the
+existing read-only AWF mount. The driver uses that installation for `NODE_PATH`
+rather than installing dependencies into, or loading them from, the worktree.
+
+The additional `profile` object contains `id: "go-repository"`, a trusted
+`repositoryDefaultBranch`, and the canonical non-secret create-PR `policy`.
+Repository-default metadata MUST NOT replace an explicit PR base or manufacture
+a base when omitted. Runtime expression bindings are resolved after JSON
+parsing, using only supported repository/branch metadata and `GH_AW_INPUT_*`
+variables. Missing bindings, secret references, and unsupported policy fields
+MUST fail before inference.
+
+Native MCP configuration MUST be bound explicitly to the SDK session. Only
+gateway HTTP/SSE definitions are accepted; subprocess servers and credential
+logging are forbidden. Catalog initialization MAY temporarily select MCP tools
+for metadata discovery, but MUST replace that selection with concrete,
+source-qualified names before inference. The driver MUST verify the resulting
+catalog and fence late initialization continuations after timeout or cancellation.
+It MUST NOT expose general shell aliases, generic task/subagent tools, or a
+model-facing MCP wildcard. Deferred tool search is disabled; at most 128
+approved tools are preloaded.
+
+MCP permission requests in this profile MUST join the SDK's canonical wire name
+to the verified catalog's `mcpServerName` and `mcpToolName`. For example, the
+permission request `github-get_file_contents` is checked against the grant
+`github(get_file_contents)`. Prefix stripping or guessed aliases MUST NOT
+authorize another raw tool. Native inspection uses `view`, `grep`, and `glob`;
+`rg` is an SDK selector, not the callable search name.
+
+| `go_repository` action | Effect |
+| --- | --- |
+| `status`, `diff` | Inspect the checkout and cumulative review changes. |
+| `prepare_branch` | Create one new allowed branch without overwriting an existing branch. Only this action accepts `branch`. |
+| `format` | Format changed, publication-eligible Go files. |
+| `readiness` | Compile the projected repository's tests without selecting tests. |
+| `validate` | Check formatting and run `go test -count=1 ./...`, `go vet ./...`, and `go build` against the exact projected publication tree. |
+| `commit` | Record the validated candidate locally with a fixed message/identity; retrying pending index synchronization does not create another commit. |
+
+Formatting validation covers the whole projected repository. If an unchanged
+baseline file is unformatted, the review is blocked until that prerequisite is
+fixed through an authorized change; `format` MUST NOT expand the publication
+scope to repair unrelated or excluded files.
+
+These operations MUST NOT accept model-supplied executables, arguments, working
+directories, or environment overrides. Execution remains inside AWF, not a
+runner-host MCP script. Go downloads, automatic toolchain switching, repository
+hooks/filters, and remote Git operations are disabled. Child environments
+exclude SDK/provider credentials and Actions command-file variables. Commands
+have bounded time, output, cancellation, and owned-process cleanup; build and
+validation copies use owned temporary storage outside the checkout.
+
+Exclusions MUST be applied before the existing allowlist/protection checks.
+Request-review and fallback policies MUST NOT become unconditional edit denials.
+Validation MUST exclude ignored files and unpublished edits, bind unambiguously
+to the committed bytes, and check cumulative publication limits rather than
+resetting them after each local commit. The initial implementation supports a
+regular-file root checkout, at most 500 changed paths, 2 MiB per inspected file,
+and an 8 MiB changed-content snapshot. It rejects symlinks and submodules in the
+projected validation tree.
+
+Publication remains a separate native safe-output declaration. The verified
+names include `safeoutputs-create_pull_request` and `safeoutputs-noop`; a
+successful local commit alone does not record a PR or complete the workflow.
+This profile MUST NOT weaken host completion gates or discard previously
+completed queued outputs after a later failure.
 
 ---
 
@@ -398,7 +484,7 @@ The implementation MUST perform best-effort cleanup of event streams, session ha
 
 Cleanup after the tool-denials guard MUST have a finite deadline for each operation, including event-stream draining, session disconnection, and client shutdown. A stalled or rejected cleanup operation MUST NOT prevent the remaining cleanup operations or replace the original guard failure. Late SDK events MUST NOT write to a closed event stream or restart session watchdogs.
 
-The reference implementation allows up to five seconds for each of these three sequential cleanup operations. Its cleanup wait is therefore bounded by fifteen seconds, excluding event-loop scheduling delays. Cleanup deadline timers remain active until their operation settles or times out so the standalone driver can reach its explicit non-zero exit even when no other SDK handles remain.
+The reference implementation allows up to five seconds for each of these three sequential cleanup operations. Its cleanup wait is therefore bounded by fifteen seconds, excluding event-loop scheduling delays. The repository profile aborts its owned work immediately and adds a preceding five-second repository-cleanup stage, for at most twenty seconds of cleanup deadlines. Temporary-tree removal is asynchronous so it cannot block the denial guard's event loop. Cleanup deadline timers remain active until their operation settles or times out so the standalone driver can reach its explicit non-zero exit even when no other SDK handles remain.
 
 This driver contract does not change the host harness's existing recovery policy for previously completed safe outputs.
 

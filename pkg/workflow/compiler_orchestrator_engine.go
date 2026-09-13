@@ -312,13 +312,22 @@ func (c *Compiler) resolveEngineFromIncludesAndImports(
 			return "", nil, "", nil, fmt.Errorf("failed to register engine definition from included file: %w", err)
 		}
 	}
-	if engineConfig == nil && len(allEngines) > 0 {
+	hasMainEngine, err := mainWorkflowSelectsEngine(result.Frontmatter)
+	if err != nil {
+		return "", nil, "", nil, err
+	}
+	if len(allEngines) > 0 && (engineConfig == nil || !hasMainEngine) {
 		orchestratorEngineLog.Printf("Extracting engine config from included file")
 		var extractedModel string
-		engineConfig, extractedModel, err = c.extractEngineConfigFromJSON(allEngines[0])
+		existingConfig := engineConfig
+		engineConfig, extractedModel, err = c.extractEngineConfigFromJSON(selectedImportedEngineJSON(allEngines))
 		if err != nil {
 			orchestratorEngineLog.Printf("Failed to extract engine config: %v", err)
 			return "", nil, "", nil, fmt.Errorf("failed to extract engine config from included file: %w", err)
+		}
+		engineConfig = inheritImportedEngineConfig(existingConfig, engineConfig)
+		if engineConfig != nil && c.engineOverride != "" {
+			engineConfig.ID = c.engineOverride
 		}
 		// Preserve the model from the main workflow frontmatter if already set;
 		// only fall back to the imported/shared workflow's model when the main
@@ -330,10 +339,8 @@ func (c *Compiler) resolveEngineFromIncludesAndImports(
 			return "", nil, "", nil, err
 		}
 	} else if model == "" && len(allEngines) > 0 {
-		// engineConfig is non-nil (e.g. from top-level max-ai-credits or other
-		// budget fields) but model has not been set by the main workflow. Extract
-		// just the model from the imported engine config so that an engine.model
-		// pin in an imported file is not silently dropped.
+		// Keep a main engine selection authoritative while allowing an imported
+		// model preference when the main workflow does not specify one.
 		_, extractedModel, extractErr := c.extractEngineConfigFromJSON(allEngines[0])
 		if extractErr == nil && extractedModel != "" {
 			model = extractedModel
@@ -499,6 +506,9 @@ func (c *Compiler) runPostEngineValidations(
 	agenticEngine CodingAgentEngine,
 	importsResult *parser.ImportsResult,
 ) error {
+	if err := c.validateMaxToolDenialsSupport(engineConfig, agenticEngine); err != nil {
+		return err
+	}
 	enableFirewallByDefaultForCopilot(engineSetting, networkPermissions, sandboxConfig)
 	enableFirewallByDefaultForClaude(engineSetting, networkPermissions, sandboxConfig)
 	enableFirewallByDefaultForPi(engineSetting, networkPermissions, sandboxConfig)

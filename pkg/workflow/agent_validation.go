@@ -154,10 +154,8 @@ func (c *Compiler) validateMaxContinuationsSupport(frontmatter map[string]any, e
 }
 
 // validateMaxToolDenialsSupport validates that max-tool-denials is only used with
-// the Copilot engine in Copilot SDK mode.
-func (c *Compiler) validateMaxToolDenialsSupport(frontmatter map[string]any, engine CodingAgentEngine) error {
-	_, engineConfig, _ := c.ExtractEngineConfig(frontmatter)
-
+// the effective Copilot SDK engine, including imported configuration.
+func (c *Compiler) validateMaxToolDenialsSupport(engineConfig *EngineConfig, engine CodingAgentEngine) error {
 	if engineConfig == nil || engineConfig.MaxToolDenials == "" {
 		return nil
 	}
