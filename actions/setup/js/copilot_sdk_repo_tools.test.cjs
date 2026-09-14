@@ -16,10 +16,8 @@ const fixtures = [];
 let goEnvironment;
 
 beforeAll(() => {
-  const [GOROOT, GOCACHE, GOMODCACHE] = execFileSync("go", ["env", "GOROOT", "GOCACHE", "GOMODCACHE"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 })
-    .trim()
-    .split(/\r?\n/);
-  goEnvironment = { GOROOT, GOCACHE, GOMODCACHE };
+  const GOROOT = execFileSync("go", ["env", "GOROOT"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 }).trim();
+  goEnvironment = { GOROOT };
 });
 
 afterEach(async () => {
@@ -51,6 +49,8 @@ function fixture({ files = {}, policy = {}, realGo = false, intercept, create = 
   const env = {
     ...Object.fromEntries(["PATH", "Path", "SystemRoot", "WINDIR", "PATHEXT", "TEMP", "TMP"].filter(key => process.env[key]).map(key => [key, process.env[key]])),
     ...goEnvironment,
+    GOCACHE: path.join(scratch, "go-build"),
+    GOMODCACHE: path.join(scratch, "go-mod"),
     HOME: home,
     USERPROFILE: home,
     GIT_CONFIG_NOSYSTEM: "1",
@@ -65,6 +65,8 @@ function fixture({ files = {}, policy = {}, realGo = false, intercept, create = 
     NODE_OPTIONS: "--fixture-must-not-reach-children",
     CI: "true",
   };
+  fs.mkdirSync(env.GOCACHE);
+  fs.mkdirSync(env.GOMODCACHE);
   function git(args) {
     return execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", ...args], { cwd: root, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 }).trim();
   }
@@ -118,6 +120,8 @@ describe("fixed go_repository contract", () => {
     expect(f.runtime.tool).toMatchObject({ name: "go_repository", defer: "never", parameters: { additionalProperties: false, required: ["action"] } });
     expect(f.runtime.tool.parameters.properties.action.enum).toEqual(REPOSITORY_ACTIONS);
     expect(Object.keys(f.runtime.tool.parameters.properties)).toEqual(["action", "branch"]);
+    expect(f.env.GOCACHE).toBe(path.join(f.scratch, "go-build"));
+    expect(f.env.GOMODCACHE).toBe(path.join(f.scratch, "go-mod"));
   });
 
   it.each([{}, null, [], { action: "shell" }, { action: "validate", command: "ignored" }, { action: "status", cwd: ".." }, { action: "format", env: {} }, { action: "status", branch: "main" }, Object.create({ action: "status" })])(

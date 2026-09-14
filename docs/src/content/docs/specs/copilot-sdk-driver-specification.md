@@ -348,6 +348,16 @@ gateway HTTP/SSE definitions are accepted; subprocess servers and credential
 logging are forbidden. The dedicated safe-outputs bundle MUST include all local
 module dependencies; startup coverage must load that isolated bundle rather than
 rely on files available only in the full source tree.
+Compatibility coverage MUST also traverse the actual MCP gateway. A direct
+backend connection does not cover gateway discovery, protocol negotiation, or
+authentication. Stateful gateways must negotiate a legacy `initialize` handshake;
+enabling sessionless transport is not a substitute for compatible negotiation.
+The native SDK repository integration has separate direct and gateway modes.
+Set `GH_AW_TEST_MCP_GATEWAY_BINARY` to an absolute gateway executable path to
+enable the latter. It verifies authenticated routes, the native catalog,
+Go/Git operations, safe-output recording, and zero model-provider requests.
+An absent binary explicitly skips that integration locally; an invalid or
+failing configured binary MUST fail without falling back to the direct mode.
 Catalog initialization MAY temporarily select MCP tools
 for metadata discovery, but MUST replace that selection with concrete,
 source-qualified names before inference. The driver MUST verify the resulting
