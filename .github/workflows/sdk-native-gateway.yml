@@ -1,0 +1,58 @@
+name: Native SDK gateway integration
+
+on:
+  push:
+    branches: [main, fix/native-gateway-compatibility]
+  pull_request:
+    paths:
+      - actions/setup/js/copilot_sdk*.cjs
+      - actions/setup/js/fixtures/copilot_sdk*.cjs
+      - actions/setup/js/fixtures/safeoutputs_bundle.fixture.cjs
+      - actions/setup/js/package.json
+      - actions/setup/js/package-lock.json
+      - .github/workflows/sdk-native-gateway.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the SDK driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: gh-aw
+          persist-credentials: false
+      - name: Check out the stateful gateway correction
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: jpmicrosoft/gh-aw-mcpg
+          ref: 5f3e10b4c9c189c27468b0d7a81c01cb065f73d0
+          path: gateway-source
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.1"
+          cache-dependency-path: gateway-source/go.sum
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: gh-aw/actions/setup/js/package-lock.json
+      - name: Build the actual gateway
+        working-directory: gateway-source
+        run: go build -o "$RUNNER_TEMP/awmg" .
+      - name: Install the pinned SDK test dependencies
+        working-directory: gh-aw/actions/setup/js
+        run: npm ci --no-audit --no-fund
+      - name: Exercise native tools without model requests
+        working-directory: gh-aw/actions/setup/js
+        env:
+          GH_AW_TEST_MCP_GATEWAY_BINARY: ${{ runner.temp }}/awmg
+        run: |
+          test -x "$GH_AW_TEST_MCP_GATEWAY_BINARY"
+          npm run typecheck
+          npm run test:js -- --no-file-parallelism copilot_sdk_gateway_fixture.test.cjs copilot_sdk_repository_integration.test.cjs
