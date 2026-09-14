@@ -32,20 +32,26 @@ function prepareFixture(scratch, remaining) {
   const root = path.join(scratch, "checkout");
   const home = path.join(scratch, "home");
   const sdkHome = path.join(scratch, "sdk-home");
-  for (const directory of [root, home, sdkHome]) fs.mkdirSync(directory);
+  const goCache = path.join(scratch, "go-build");
+  const goModCache = path.join(scratch, "go-mod");
+  for (const directory of [root, home, sdkHome, goCache, goModCache]) fs.mkdirSync(directory);
   const safeOutputsBundle = path.join(scratch, "safeoutputs-bundle");
   copySafeOutputsBundle(safeOutputsBundle);
   const loadSafeOutputs = createRequire(path.join(safeOutputsBundle, "safe_outputs_mcp_server_http.cjs"));
   fs.mkdirSync(path.join(root, "docs"));
   const branch = `automation/sdk-${randomUUID()}`;
   const artifacts = [getPatchPathForBranch(branch), getPatchPathForBranchInRepo(branch, "fixture/repository")].map(filename => path.resolve(filename));
-  const goEnv = execFileSync("go", ["env", "GOROOT", "GOCACHE", "GOMODCACHE"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: Math.min(30_000, remaining()) })
-    .trim()
-    .split(/\r?\n/);
   const minimalEnv = Object.fromEntries(["PATH", "Path", "SystemRoot", "WINDIR", "PATHEXT"].filter(key => process.env[key]).map(key => [key, process.env[key]]));
   const gitConfig = path.join(home, "gitconfig");
   fs.writeFileSync(gitConfig, "");
   Object.assign(minimalEnv, { HOME: home, USERPROFILE: home, TEMP: scratch, TMP: scratch, TMPDIR: scratch, GIT_CONFIG_GLOBAL: gitConfig, GIT_CONFIG_NOSYSTEM: "1", GIT_ALLOW_PROTOCOL: "", GIT_TERMINAL_PROMPT: "0" });
+  const goRoot = execFileSync("go", ["env", "GOROOT"], {
+    cwd: home,
+    env: { ...minimalEnv, GOTOOLCHAIN: "local", GOWORK: "off", GOENV: "off" },
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: Math.min(30_000, remaining()),
+  }).trim();
   function git(args) {
     return execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", ...args], {
       cwd: root,
@@ -103,9 +109,9 @@ function prepareFixture(scratch, remaining) {
     GH_AW_SAFE_OUTPUTS_TOOLS_PATH: definitions,
     GH_AW_SAFE_OUTPUTS: output,
     GH_AW_MCP_LOG_DIR: path.join(scratch, "mcp-logs"),
-    GOROOT: goEnv[0],
-    GOCACHE: goEnv[1],
-    GOMODCACHE: goEnv[2],
+    GOROOT: goRoot,
+    GOCACHE: goCache,
+    GOMODCACHE: goModCache,
   });
   return { root, sdkHome, loadSafeOutputs, branch, artifacts, minimalEnv, git, baseline, toolConfig, output };
 }

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
@@ -11,7 +14,25 @@ async function runFixture(mode) {
   const env = { ...process.env };
   delete env.GH_AW_TEST_MCP_GATEWAY_BINARY;
   if (mode === "gateway") env.GH_AW_TEST_MCP_GATEWAY_BINARY = gatewayBinary;
-  const result = await promisify(execFile)(process.execPath, [filename, `--${mode}`], { env, encoding: "utf8", timeout: 240_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true });
+  const ambient = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-sdk-absent-go-caches-"));
+  env.GOCACHE = path.join(ambient, "absent-build");
+  env.GOMODCACHE = path.join(ambient, "absent-modules");
+  let result;
+  let executionError;
+  try {
+    result = await promisify(execFile)(process.execPath, [filename, `--${mode}`], { env, encoding: "utf8", timeout: 240_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true });
+    expect(fs.existsSync(env.GOCACHE), "fixture must not create or reuse the host build cache").toBe(false);
+    expect(fs.existsSync(env.GOMODCACHE), "fixture must not create or reuse the host module cache").toBe(false);
+  } catch (error) {
+    executionError = error;
+    throw error;
+  } finally {
+    try {
+      fs.rmSync(ambient, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch (cleanupError) {
+      throw new AggregateError(executionError ? [executionError, cleanupError] : [cleanupError], "SDK fixture host-cache cleanup failed", { cause: executionError });
+    }
+  }
   const lines = result.stdout.split(/\r?\n/).filter(value => value.startsWith("SDK_REPOSITORY_RESULT="));
   expect(lines, result.stderr).toHaveLength(1);
   const evidence = JSON.parse(lines[0].slice("SDK_REPOSITORY_RESULT=".length));
