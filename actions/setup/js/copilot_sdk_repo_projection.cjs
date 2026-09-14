@@ -6,7 +6,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { buildExcludePathspecs } = require("./git_patch_utils.cjs");
 const { embedBaseCommit } = require("./generate_git_patch.cjs");
-const { parseRepositoryChanges } = require("./copilot_sdk_repo_workspace.cjs");
+const { parseRepositoryChanges, parseRepositoryPaths, MAX_REPOSITORY_FILES } = require("./copilot_sdk_repo_workspace.cjs");
+const { repositoryMutationError } = require("./copilot_sdk_repo_diagnostics.cjs");
 
 /** @typedef {ReturnType<typeof import("./copilot_sdk_repo_workspace.cjs").createRepositoryWorkspace>} RepositoryWorkspace */
 /** @typedef {{filename: string, copy?: string, mode?: string, blob?: string}} FrozenEntry */
@@ -108,7 +109,18 @@ async function materializeRepositoryProjection(workspace, projection, directory,
 async function verifyRepositoryProjection(workspace, projection, directory, signal) {
   const changed = await workspace.run("git", ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", projection.tree, "--"], signal, { directory });
   const untracked = await workspace.run("git", ["ls-files", "--others", "-z"], signal, { directory });
-  if (changed.stdout || untracked.stdout) throw new Error("Go validation changed or added files in the projected checkout");
+  if (changed.stdout || untracked.stdout) {
+    let trackedPaths;
+    let untrackedPaths;
+    try {
+      trackedPaths = parseRepositoryPaths(changed.stdout);
+      untrackedPaths = parseRepositoryPaths(untracked.stdout);
+      if (trackedPaths.length + untrackedPaths.length > MAX_REPOSITORY_FILES) throw new Error("Excessive mutation path list");
+    } catch {
+      throw new Error("Go validation changed or added files in the projected checkout; path details withheld (unsafe, incomplete, or excessive file list)");
+    }
+    throw repositoryMutationError(trackedPaths, untrackedPaths, workspace.diagnosticSecrets);
+  }
 }
 
 module.exports = { requireObjectID, stageRepositoryProjection, materializeRepositoryProjection, verifyRepositoryProjection };

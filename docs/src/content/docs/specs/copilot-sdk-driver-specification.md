@@ -356,6 +356,19 @@ The native SDK repository integration has separate direct and gateway modes.
 Set `GH_AW_TEST_MCP_GATEWAY_BINARY` to an absolute gateway executable path to
 enable the latter. It verifies authenticated routes, the native catalog,
 Go/Git operations, safe-output recording, and zero model-provider requests.
+Failure coverage MUST invoke `session.rpc.tools.execute`, not only direct
+custom-tool handlers. Both modes exercise a passing Go test that writes an
+ignored receipt into the projection, a nonzero Go test command with distinct
+stdout/stderr diagnostics, blocked commits after both failures, and the repaired
+validation/commit/publication sequence. These checks MUST NOT send a model
+prompt. Per-operation timings diagnose cold-cache failures without extending
+the fixture or operation deadlines.
+The promptless native API emits `external_tool.requested` and
+`external_tool.completed`, correlated by request ID; the completion notification
+does not contain an outcome. Failure status and diagnostic content are asserted
+from the actual `tools.execute` result. Model-driven `tool.execution_complete`
+error persistence is covered separately by driver event tests, not fabricated
+from promptless completion notifications.
 Both modes own their Go build and module caches under the fixture scratch
 directory; they must also pass when the host's configured caches do not exist.
 The initial GOROOT probe uses the installed local toolchain from the isolated
@@ -399,12 +412,74 @@ exclude SDK/provider credentials and Actions command-file variables. Commands
 have bounded time, output, cancellation, and owned-process cleanup; build and
 validation copies use owned temporary storage outside the checkout.
 
+Ordinary errors from an owned `go_repository` operation MUST return a first-class
+SDK `ToolResultObject`, not a thrown exception that the native pipeline can reduce
+to a generic failure. The failure object has this shape:
+
+```ts
+{ resultType: "failure", textResultForLlm: diagnostic, error: diagnostic }
+```
+
+`error` is a string, not an object. The envelope MUST be explicitly typed against
+the SDK contract. JSON-stringifying that envelope, returning `{ success: false }`,
+or using MCP `isError` is not equivalent. Successful operations retain their
+existing JSON-string response shape. Inactive-runtime, malformed-input, and
+concurrent-call preflight guards remain rejections.
+
+Diagnostics MUST NOT determine outcome, cancellation, timeout, or permission
+status by inspecting message text. Nonzero exits remain failures even if their
+output says `PASS`; words such as `denied` or `timeout` do not create a permission
+denial or timeout. Command failures preserve the command/exit status and labeled
+excerpts of both nonempty stdout and stderr.
+
+The final **serialized SDK failure envelope** MUST fit within **8192 UTF-8 bytes**,
+including JSON escape expansion, both copies of the diagnostic, and truncation
+markers. Mutation summaries display at most **20 paths**, with at most **256
+rendered UTF-8 bytes per path**, including any path truncation marker. Truncation
+MUST be explicit and reserve space for both nonempty process streams.
+Redaction applies to complete, already-bounded inputs before excerpt selection,
+including masks declared after their first use, in the other stream, or outside
+the displayed excerpt. The implementation reuses the built-in credential
+patterns and Actions `add-mask` helpers, masks Authorization values, URL userinfo
+and supported credential query fields, and accepts additional exact-match
+authentication masks only from values the caller already holds. It MUST NOT
+discover platform secrets or read credential files. This is not a guarantee of
+arbitrary-secret detection.
+Controls, terminal escape sequences, bidi/invisible formatting controls, and
+dangerous log/markup framing are rendered literally. Stack traces, causes and
+`AggregateError.errors` are not expanded. A formatter or redactor exception
+returns a fixed, prebounded, non-sensitive failure envelope, never raw detail.
+These pure helpers MUST load in the separately copied actions runtime with its
+existing dependencies, without adding an `@actions/core` startup dependency.
+
 Exclusions MUST be applied before the existing allowlist/protection checks.
 Request-review and fallback policies MUST NOT become unconditional edit denials.
-Validation MUST exclude ignored files and unpublished edits, bind unambiguously
-to the committed bytes, and check cumulative publication limits rather than
-resetting them after each local commit. The initial implementation supports a
-regular-file root checkout, at most 500 changed paths, 2 MiB per inspected file,
+Projection MUST exclude pre-existing ignored files and unpublished edits.
+This exclusion does **not** permit validation-generated ignored files: any
+tracked change or untracked addition in the projected checkout MUST reject
+validation, including an ignored receipt written by a passing test.
+Integrity checks retain NUL-delimited `git diff --name-only -z` and
+`git ls-files --others -z` output, without an `--exclude-standard` exemption.
+Diagnostics distinguish tracked changes from untracked additions, using only
+validated, deduplicated, sorted relative paths. Unsafe, incomplete or excessive
+lists remain failures with a details-withheld explanation; the implementation
+MUST NOT read those files or sanitize an invalid path into an accepted path.
+
+Validation MUST bind unambiguously to the committed bytes and check cumulative
+publication limits rather than resetting them after each local commit. A new full
+validation attempt invalidates the previous candidate before checkout preflight.
+A failed or cancelled readiness/full-validation check MUST NOT leave a reusable
+validated candidate. A candidate becomes reusable only after all projected-tree
+checks, temporary cleanup, and the final cancellation check succeed. The original
+rejectable operation promise and cleanup metadata remain owned until settlement;
+formatting its failure for the SDK MUST NOT turn that internal promise into a
+successful cleanup result. Aborting an SDK invocation signal after ordinary
+request completion MUST NOT invalidate an already successful validation.
+Post-commit compare-and-swap bookkeeping and retryable index synchronization
+remain intact.
+
+The initial implementation supports a regular-file root checkout, at most
+500 changed paths, 2 MiB per inspected file,
 and an 8 MiB changed-content snapshot. It rejects symlinks and submodules in the
 projected validation tree.
 
@@ -473,6 +548,30 @@ All structured log entries emitted by a conforming implementation MUST conform t
 | `requestKind` | string | MUST | Permission request kind: one of `"read"`, `"write"`, `"url"`, `"shell"`, `"mcp"`, `"custom-tool"` |
 | `requestSummary` | string | MUST | Compact human-readable summary of the denied request (MUST NOT include secret values or raw token content) |
 | `level` | string | MUST | MUST be `"warning"` or `"error"` |
+
+#### 6.5.3 Repository Tool Completion Errors
+
+For a failed `go_repository` completion, the driver MUST retain a bounded,
+sanitized `data.error.message` when the SDK supplies an error, including events
+with no `data.result`. It MUST preserve explicit `success: false` and the existing
+native result payload; adding diagnostic text MUST NOT synthesize success.
+Reformatting a native diagnostic for logging MUST preserve independently
+budgeted stdout/stderr sections rather than flattening and dropping the final
+stream. Event formatting redacts the complete message before interpreting
+display labels, retains at most 32 sections and 20 path summaries, and renders
+section separators literally. Labels affect presentation only, never outcome
+classification or path authorization.
+Error codes, remediation objects, stacks and nested causes are not copied into
+this diagnostic. The pending-call map and completion watchdog retain their
+existing behavior.
+
+Repository failure messages use the same redaction, literal rendering and
+serialized-envelope budget as Section 5.7. They are written through the existing
+JSONL event serializer, not independently printed as raw error or process-output
+log lines. Embedded newlines, forged JSONL records, terminal controls, markup and
+Actions command framing MUST NOT create additional log records or commands.
+Ordinary operation failures MUST NOT increment the permission-denial counter or
+trigger first-denial shutdown.
 
 ---
 
@@ -550,6 +649,17 @@ Implementations MUST provide automated tests for all Level 1 and Level 2 require
 
 - **T-CSD-201**: Lifecycle logs include connection, session, prompt, completion, and failure markers.
 - **T-CSD-202**: Permission denial logs include compact request summary.
+- **T-CSD-203**: Repository error-only completion events preserve sanitized failure messages, explicit failure status, and pending-call/completed-output recovery behavior without counting permission denials.
+
+#### 8.1.5 Repository Diagnostic Tests
+
+Repository tests MUST cover final serialized-envelope boundaries and UTF-8/escape
+expansion, late and cross-stream redaction, literal control/framing rendering,
+bounded mutation summaries, and fixed failure fallback when formatting throws.
+State regressions MUST cover failed/cancelled revalidation, cleanup failure after
+successful Go stages, normal SDK request-signal completion, and commit/index-sync
+recovery. Native direct/gateway regressions MUST verify the failures and repaired
+sequence described in Section 5.7 without inference.
 
 ### 8.2 Compliance Checklist
 
@@ -635,9 +745,14 @@ The canonical gh-aw implementation for this specification is centered in:
 - `actions/setup/js/copilot_sdk_driver.cjs`
 - `actions/setup/js/copilot_sdk_session.cjs`
 - `actions/setup/js/copilot_sdk_permissions.cjs`
+- `actions/setup/js/copilot_sdk_repo_diagnostics.cjs`
+- `actions/setup/js/copilot_sdk_repo_tools.cjs`
 - `actions/setup/js/copilot_harness.cjs`
 - `actions/setup/js/copilot_sdk_driver.test.cjs`
 - `actions/setup/js/copilot_sdk_permissions.test.cjs`
+- `actions/setup/js/copilot_sdk_repo_diagnostics.test.cjs`
+- `actions/setup/js/copilot_sdk_repo_tools.test.cjs`
+- `actions/setup/js/copilot_sdk_repository_integration.test.cjs`
 
 This specification MUST be revalidated whenever any of the following occurs:
 
@@ -655,6 +770,7 @@ This specification MUST be revalidated whenever any of the following occurs:
 - Clarified command-token matching and all-segment authorization for subcommand-scoped shell grants.
 - Required independent denial-guard termination and bounded cleanup, with regression coverage for stalled SDK operations.
 - Preserved the existing host harness publication and recovery policy.
+- Defined native repository failure envelopes, bounded sanitized diagnostics, error-only event persistence, and cleanup-gated validation state without relaxing projection integrity.
 
 ### Version 1.0.2 (Draft Specification)
 

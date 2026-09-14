@@ -1695,7 +1695,7 @@ describe("copilot_sdk_driver.cjs", () => {
           if (!onPermissionRequest) throw new Error("SDK permission handler is not installed");
           return onPermissionRequest({ kind: "shell", commands: [{ identifier: "denied" }], fullCommandText: "denied" });
         },
-        run() {
+        run(options = {}) {
           harness.running = runWithCopilotSDK({
             sdkUri: "http://127.0.0.1:3002",
             prompt: "test prompt",
@@ -1708,6 +1708,7 @@ describe("copilot_sdk_driver.cjs", () => {
               RuntimeConnection: { forUri: vi.fn(() => ({})) },
               approveAll: () => ({ kind: "approve-once" }),
             },
+            ...options,
           });
           harness.running.then(harness.completed, harness.rejected);
           return harness.running;
@@ -1783,12 +1784,12 @@ describe("copilot_sdk_driver.cjs", () => {
       expect(events.filter(event => event.type === "guard.tool_denials_exceeded")).toHaveLength(1);
     });
 
-    it("does not count ordinary tool execution failures as permission denials", async () => {
-      const harness = makeGuardHarness("session-guard-execution-failures");
+    it.each(["bash", "go_repository"])("does not count ordinary %s execution failures as permission denials", async toolName => {
+      const harness = makeGuardHarness(`session-guard-execution-failures-${toolName}`);
       harness.run();
       await harness.sendStarted.promise;
       for (let count = 0; count < 6; count++) {
-        harness.emit("tool.execution_start", { toolCallId: `failed-${count}`, toolName: "bash" });
+        harness.emit("tool.execution_start", { toolCallId: `failed-${count}`, toolName });
         harness.emit("tool.execution_complete", { toolCallId: `failed-${count}`, success: false, error: { message: "command failed" } });
       }
       for (let count = 0; count < 4; count++) harness.deny();
@@ -1799,6 +1800,114 @@ describe("copilot_sdk_driver.cjs", () => {
       expect(events.filter(event => event.type === "guard.tool_denials_exceeded")).toHaveLength(0);
       expect(harness.completed).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 0, output: "recovered from command failures" }));
       expect(harness.coreLogger.warning).toHaveBeenCalledTimes(4);
+    });
+
+    it.each(["matched-start", "description-only", "implicit-failure"])("preserves bounded, sanitized repository error-only completion events (%s)", async mode => {
+      const harness = makeGuardHarness(`session-repository-error-only-${mode}`);
+      const connectionToken = "held-connection-canary";
+      const gatewayToken = "held-gateway-canary";
+      const lateMask = "event-late-mask-canary";
+      const message = [
+        `go test failed with exit code 1; stdout-marker PASS denied timeout ${connectionToken} ${gatewayToken} ${lateMask}`,
+        '\r\0\x1b]0;title\x07\u202e{"type":"forged"}\n::error::forged\n<script>`',
+        "x".repeat(16_000),
+        `::add-mask::${lateMask}`,
+      ].join("\n");
+      harness.run({ maxToolDenials: 1, connectionToken, mcpServers: { gateway: { type: "http", url: "http://127.0.0.1:3003/mcp", headers: { Authorization: `Bearer ${gatewayToken}` } } } });
+      await harness.sendStarted.promise;
+      if (mode !== "description-only") harness.emit("tool.execution_start", { toolCallId: "repository-failure", toolName: "go_repository" });
+      harness.emit("tool.execution_complete", {
+        toolCallId: "repository-failure",
+        toolDescription: { name: "go_repository" },
+        ...(mode === "implicit-failure" ? {} : { success: false }),
+        error: { message, code: "untrusted-code-canary", remediation: "untrusted-remediation-canary" },
+      });
+      harness.emit("assistant.message", { content: "Recovered repository explanation." });
+      harness.send.reject(new Error("Timeout after 600000ms waiting for session.idle"));
+      await vi.advanceTimersByTimeAsync(0);
+
+      const completion = events.find(event => event.type === "tool.execution_complete");
+      expect(completion.data).toEqual({ toolName: "go_repository", mcpServerName: "", success: false, error: { message: expect.any(String) } });
+      const diagnostic = completion.data.error.message;
+      expect(diagnostic).toContain("go test failed with exit code 1");
+      expect(diagnostic).toContain("stdout-marker");
+      expect(diagnostic).toContain("[truncated]");
+      expect(Buffer.byteLength(JSON.stringify({ resultType: "failure", textResultForLlm: diagnostic, error: diagnostic }), "utf8")).toBeLessThanOrEqual(8192);
+      expect(diagnostic).not.toMatch(/[\x00-\x1f\u202e]/);
+      const serialized = JSON.stringify(events);
+      for (const value of [connectionToken, gatewayToken, lateMask, "::error::", "::add-mask::", "<script>", "untrusted-code-canary", "untrusted-remediation-canary"]) expect(serialized).not.toContain(value);
+      expect(harness.logger.mock.calls.some(([line]) => line.includes("stdout-marker"))).toBe(false);
+      for (const [line] of vi.mocked(process.stderr.write).mock.calls) expect(String(line).split("\n")).toHaveLength(2);
+      expect(events.some(event => event.type === "guard.tool_denials_exceeded")).toBe(false);
+      expect(harness.coreLogger.warning).not.toHaveBeenCalled();
+      expect(harness.completed).toHaveBeenCalledWith(expect.objectContaining({ exitCode: 0, hasOutput: true, output: "Recovered repository explanation." }));
+      expect(harness.disconnect).toHaveBeenCalledTimes(1);
+    });
+
+    it("preserves both streams when persisting an actual bounded repository failure", async () => {
+      const { createRepositoryFailure, repositoryCommandError } = require("./copilot_sdk_repo_diagnostics.cjs");
+      const failure = createRepositoryFailure(
+        repositoryCommandError("go test", {
+          exitCode: 1,
+          stdout: "stdout-marker " + "x".repeat(250_000),
+          stderr: "stderr-marker",
+        })
+      );
+      const harness = makeGuardHarness("session-repository-bounded-roundtrip");
+      harness.run({ maxToolDenials: 1 });
+      await harness.sendStarted.promise;
+      harness.emit("tool.execution_start", { toolCallId: "bounded-failure", toolName: "go_repository" });
+      harness.emit("tool.execution_complete", { toolCallId: "bounded-failure", success: false, error: { message: failure.error } });
+      harness.send.resolve({ data: { content: "validation remains blocked" } });
+      await vi.advanceTimersByTimeAsync(0);
+
+      const completion = events.find(event => event.type === "tool.execution_complete");
+      expect(completion.data.success).toBe(false);
+      const diagnostic = completion.data.error.message;
+      expect(diagnostic).toContain("stdout: stdout-marker");
+      expect(diagnostic).toContain("stderr: stderr-marker");
+      expect(Buffer.byteLength(JSON.stringify({ resultType: "failure", textResultForLlm: diagnostic, error: diagnostic }), "utf8")).toBeLessThanOrEqual(8192);
+      expect(events.some(event => event.type === "guard.tool_denials_exceeded")).toBe(false);
+    });
+
+    it("keeps native result payloads and explicit success values unchanged", async () => {
+      const harness = makeGuardHarness("session-repository-result-preservation");
+      harness.run();
+      await harness.sendStarted.promise;
+      const result = { content: '{"action":"status","exitCode":0,"stdout":"ordinary result","stderr":""}' };
+      for (const success of [true, false]) {
+        harness.emit("tool.execution_start", { toolCallId: String(success), toolName: "go_repository" });
+        harness.emit("tool.execution_complete", { toolCallId: String(success), success, result });
+      }
+      harness.send.resolve({ data: { content: "done" } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events.filter(event => event.type === "tool.execution_complete").map(event => event.data)).toEqual([
+        { toolName: "go_repository", mcpServerName: "", success: true, result },
+        { toolName: "go_repository", mcpServerName: "", success: false, result },
+      ]);
+    });
+
+    it("uses the fixed failure diagnostic, not a raw fallback, when event error extraction throws", async () => {
+      const harness = makeGuardHarness("session-repository-event-format-failure");
+      harness.run();
+      await harness.sendStarted.promise;
+      harness.emit("tool.execution_complete", {
+        toolDescription: { name: "go_repository" },
+        success: false,
+        error: {
+          get message() {
+            throw new Error("raw-extraction-canary");
+          },
+        },
+      });
+      harness.send.resolve({ data: { content: "done" } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events.find(event => event.type === "tool.execution_complete").data).toMatchObject({
+        success: false,
+        error: { message: require("./copilot_sdk_repo_diagnostics.cjs").REPOSITORY_DIAGNOSTIC_FALLBACK },
+      });
+      expect(JSON.stringify(events)).not.toContain("raw-extraction-canary");
+      expect(harness.coreLogger.warning).not.toHaveBeenCalled();
     });
 
     it.each([

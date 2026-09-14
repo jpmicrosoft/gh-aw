@@ -36,9 +36,28 @@ async function runFixture(mode) {
   const lines = result.stdout.split(/\r?\n/).filter(value => value.startsWith("SDK_REPOSITORY_RESULT="));
   expect(lines, result.stderr).toHaveLength(1);
   const evidence = JSON.parse(lines[0].slice("SDK_REPOSITORY_RESULT=".length));
-  expect(evidence).toMatchObject({ mode, catalogVerified: true, authChecked: true, providerRequests: 0, unexpectedRequests: 0, backendAuthFailures: 0, backendErrors: [], reads: 1, forbiddenCalls: 0 });
+  console.info("SDK_REPOSITORY_TIMINGS=" + JSON.stringify({ mode, operations: evidence.operationTimings }));
+  expect(evidence).toMatchObject({ mode, catalogVerified: true, authChecked: true, providerRequests: 0, unexpectedRequests: 0, backendAuthFailures: 0, backendErrors: [], reads: 1, forbiddenCalls: 0, permissionDenials: 0 });
   expect(evidence.outputs).toEqual(["create_pull_request", "noop"]);
-  expect(evidence.actions).toEqual(["status", "prepare_branch", "format", "validate", "commit", "diff"]);
+  expect(evidence.actions).toEqual(["status", "prepare_branch", "validate", "commit", "validate", "commit", "format", "validate", "commit", "diff"]);
+  expect(evidence.nativeFailures.map(failure => failure.action)).toEqual(["validate", "commit", "validate", "commit"]);
+  for (const failure of evidence.nativeFailures) {
+    expect(failure).toMatchObject({ resultType: "failure", completionRequestId: expect.any(String) });
+    expect(failure.completionRequestId).not.toBe("");
+    expect(Buffer.byteLength(JSON.stringify({ resultType: failure.resultType, textResultForLlm: failure.textResultForLlm, error: failure.error }), "utf8")).toBeLessThanOrEqual(8192);
+  }
+  expect(new Set(evidence.nativeFailures.map(failure => failure.completionRequestId)).size).toBe(4);
+  for (const text of [evidence.nativeFailures[0].textResultForLlm, evidence.nativeFailures[0].error]) expect(text).toContain("untracked addition: validation-receipt.json");
+  for (const text of [evidence.nativeFailures[2].textResultForLlm, evidence.nativeFailures[2].error]) {
+    expect(text).toContain("go test failed with exit code 1");
+    expect(text).toMatch(/stdout: [^\n]*NATIVE_STDOUT_DIAGNOSTIC/);
+    expect(text).toMatch(/stderr: [^\n]*NATIVE_STDERR_DIAGNOSTIC/);
+  }
+  for (const index of [1, 3]) {
+    expect(evidence.nativeFailures[index].textResultForLlm).toContain("Run validate successfully");
+    expect(evidence.nativeFailures[index].error).toContain("Run validate successfully");
+  }
+  expect(evidence.operationTimings.map(timing => timing.action)).toEqual(evidence.actions);
   expect(evidence.nativeTools.length).toBeGreaterThan(30);
   for (const name of ["bash", "write_bash", "task", "noop", "github-delete_file"]) expect(evidence.nativeTools).not.toContain(name);
   expect(Object.keys(evidence.backendRequests).sort()).toEqual(routes);
