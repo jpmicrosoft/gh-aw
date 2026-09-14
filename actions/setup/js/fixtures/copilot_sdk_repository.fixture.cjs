@@ -41,11 +41,17 @@ function prepareFixture(scratch, remaining) {
   fs.mkdirSync(path.join(root, "docs"));
   const branch = `automation/sdk-${randomUUID()}`;
   const artifacts = [getPatchPathForBranch(branch), getPatchPathForBranchInRepo(branch, "fixture/repository")].map(filename => path.resolve(filename));
-  const goRoot = execFileSync("go", ["env", "GOROOT"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: Math.min(30_000, remaining()) }).trim();
   const minimalEnv = Object.fromEntries(["PATH", "Path", "SystemRoot", "WINDIR", "PATHEXT"].filter(key => process.env[key]).map(key => [key, process.env[key]]));
   const gitConfig = path.join(home, "gitconfig");
   fs.writeFileSync(gitConfig, "");
   Object.assign(minimalEnv, { HOME: home, USERPROFILE: home, TEMP: scratch, TMP: scratch, TMPDIR: scratch, GIT_CONFIG_GLOBAL: gitConfig, GIT_CONFIG_NOSYSTEM: "1", GIT_ALLOW_PROTOCOL: "", GIT_TERMINAL_PROMPT: "0" });
+  const goRoot = execFileSync("go", ["env", "GOROOT"], {
+    cwd: home,
+    env: { ...minimalEnv, GOTOOLCHAIN: "local", GOWORK: "off", GOENV: "off" },
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: Math.min(30_000, remaining()),
+  }).trim();
   function git(args) {
     return execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", ...args], {
       cwd: root,

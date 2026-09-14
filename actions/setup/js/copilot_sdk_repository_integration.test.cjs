@@ -18,12 +18,20 @@ async function runFixture(mode) {
   env.GOCACHE = path.join(ambient, "absent-build");
   env.GOMODCACHE = path.join(ambient, "absent-modules");
   let result;
+  let executionError;
   try {
     result = await promisify(execFile)(process.execPath, [filename, `--${mode}`], { env, encoding: "utf8", timeout: 240_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true });
     expect(fs.existsSync(env.GOCACHE), "fixture must not create or reuse the host build cache").toBe(false);
     expect(fs.existsSync(env.GOMODCACHE), "fixture must not create or reuse the host module cache").toBe(false);
+  } catch (error) {
+    executionError = error;
+    throw error;
   } finally {
-    fs.rmSync(ambient, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    try {
+      fs.rmSync(ambient, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch (cleanupError) {
+      throw new AggregateError(executionError ? [executionError, cleanupError] : [cleanupError], "SDK fixture host-cache cleanup failed", { cause: executionError });
+    }
   }
   const lines = result.stdout.split(/\r?\n/).filter(value => value.startsWith("SDK_REPOSITORY_RESULT="));
   expect(lines, result.stderr).toHaveLength(1);

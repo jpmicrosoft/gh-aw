@@ -358,6 +358,8 @@ enable the latter. It verifies authenticated routes, the native catalog,
 Go/Git operations, safe-output recording, and zero model-provider requests.
 Both modes own their Go build and module caches under the fixture scratch
 directory; they must also pass when the host's configured caches do not exist.
+The initial GOROOT probe uses the installed local toolchain from the isolated
+fixture home, not the enclosing compiler checkout's toolchain selection.
 An absent binary explicitly skips that integration locally; an invalid or
 failing configured binary MUST fail without falling back to the direct mode.
 Catalog initialization MAY temporarily select MCP tools
