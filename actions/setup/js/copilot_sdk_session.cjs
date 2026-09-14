@@ -10,7 +10,7 @@
  * Event mapping:
  *   SDK "user.message"            → JSONL "user.message"
  *   SDK "tool.execution_start"    → JSONL "tool.execution_start"  (toolName, mcpServerName, command?)
- *   SDK "tool.execution_complete" → JSONL "tool.execution_complete" (toolName, mcpServerName, success, result)
+ *   SDK "tool.execution_complete" → JSONL "tool.execution_complete" (toolName, mcpServerName, success, result, repository error?)
  *   SDK "assistant.message"       → JSONL "assistant.message"     (content)
  *   SDK "assistant.turn_start"    → watchdog disarmed (inAssistantTurn = true)
  *   SDK "assistant.turn_end"      → watchdog re-enabled (inAssistantTurn = false)
@@ -44,6 +44,7 @@ const { finished } = require("stream/promises");
 const { buildCopilotSDKPermissionHandler, getEnvPositiveIntOrDefault, parseMaxToolDenialsLimit, MAX_TOOL_DENIALS_DEFAULT } = require("./copilot_sdk_permissions.cjs");
 const { buildCopilotSDKSessionToolConfig } = require("./copilot_sdk_tool_config.cjs");
 const { createCopilotSDKRepositoryRuntime } = require("./copilot_sdk_repo_tools.cjs");
+const { createRepositoryEventFailure } = require("./copilot_sdk_repo_diagnostics.cjs");
 const { restrictCopilotSDKRepositoryCatalog } = require("./copilot_sdk_tool_catalog.cjs");
 const { resolveModelWithFallback } = require("./model_fallback.cjs");
 const { extractShellCommandFromToolData } = require("./tool_call_details.cjs");
@@ -168,6 +169,13 @@ async function runWithCopilotSDK({
   const catalogCancellation = new AbortController();
   /** @type {NonNullable<import("@github/copilot-sdk").ToolInvocation["availableTools"]>} */
   let verifiedToolMetadata = [];
+  const diagnosticSecrets = [...(repositoryOptions?.diagnosticSecrets ?? []), ...(connectionToken ? [connectionToken] : [])];
+  for (const server of Object.values(mcpServers ?? {})) {
+    if (!("headers" in server)) continue;
+    for (const [name, value] of Object.entries(server.headers ?? {})) {
+      if (typeof value === "string" && /^(?:authorization|proxy-authorization|x-agent-id)$/i.test(name)) diagnosticSecrets.push(value);
+    }
+  }
 
   const log = msg => logger(`[sdk-driver] ${msg}`);
   log(`attempt ${attempt + 1}: connecting to Copilot SDK at ${sdkUri}`);
@@ -316,7 +324,7 @@ async function runWithCopilotSDK({
   try {
     if (toolConfig?.profile) {
       if (typeof sdk.defineTool !== "function") throw new Error("SDK defineTool is required for go-repository");
-      repositoryRuntime = createCopilotSDKRepositoryRuntime(sdk.defineTool, toolConfig.profile, repositoryOptions);
+      repositoryRuntime = createCopilotSDKRepositoryRuntime(sdk.defineTool, toolConfig.profile, { ...repositoryOptions, diagnosticSecrets });
       await repositoryRuntime.initialize();
     }
     await client.start();
@@ -392,9 +400,10 @@ async function runWithCopilotSDK({
           // Include result.content (concise LLM-facing output) so that the log
           // parser can render tool output previews from events.jsonl directly.
           const result = event.data?.result ?? undefined;
+          const error = !success && toolName === "go_repository" && event.data?.error ? { message: createRepositoryEventFailure(event.data.error, diagnosticSecrets).textResultForLlm } : undefined;
           // max-tool-denials intentionally tracks permission denials only.
           // Tool execution failures are still logged, but do not increment the guardrail counter.
-          writeEvent("tool.execution_complete", { toolName, mcpServerName, success, result }, event.timestamp);
+          writeEvent("tool.execution_complete", { toolName, mcpServerName, success, result, ...(error ? { error } : {}) }, event.timestamp);
           break;
         }
 

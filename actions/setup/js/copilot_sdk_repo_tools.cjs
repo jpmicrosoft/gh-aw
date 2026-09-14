@@ -10,6 +10,7 @@ const { checkRepositoryPublicationFiles, validateRepositoryBranch } = require(".
 const { createRepositoryWorkspace, inspectRepositoryFile, readRepositoryFile, parseRepositoryPaths, parseRepositoryChanges, MAX_REPOSITORY_FILES } = require("./copilot_sdk_repo_workspace.cjs");
 const { requireObjectID, stageRepositoryProjection, materializeRepositoryProjection, verifyRepositoryProjection } = require("./copilot_sdk_repo_projection.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { createRepositoryFailure, repositoryCommandError } = require("./copilot_sdk_repo_diagnostics.cjs");
 
 const REPOSITORY_ACTIONS = Object.freeze(["status", "diff", "prepare_branch", "format", "readiness", "validate", "commit"]);
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
@@ -91,7 +92,7 @@ function createCopilotSDKRepositoryRuntime(defineTool, profile, options) {
   async function currentRef(signal) {
     const result = await git(["symbolic-ref", "--quiet", "HEAD"], signal, { allowFailure: true });
     if (result.exitCode === 1) return null;
-    if (result.exitCode !== 0) throw new Error(`Cannot resolve checkout branch: ${result.stderr}`);
+    if (result.exitCode !== 0) throw repositoryCommandError("Cannot resolve checkout branch: git symbolic-ref", result, options?.diagnosticSecrets);
     return result.stdout.trim();
   }
 
@@ -242,8 +243,7 @@ function createCopilotSDKRepositoryRuntime(defineTool, profile, options) {
 
   /** @param {AbortSignal} signal @param {boolean} full */
   async function validateProjection(signal, full) {
-    if (full) validated = null;
-    return workspace.withTemporaryDirectory("validation-", async staging => {
+    const { result, candidate } = await workspace.withTemporaryDirectory("validation-", async staging => {
       const frozen = await snapshot(signal, staging);
       const projection = await stageRepositoryProjection(workspace, frozen, { baseline, parent: expectedHead, staging, policy: profile.policy, signal });
       const directory = path.join(staging, "checkout");
@@ -255,16 +255,21 @@ function createCopilotSDKRepositoryRuntime(defineTool, profile, options) {
       }
       const test = await workspace.run("go", full ? ["test", "-count=1", "./..."] : ["test", "-run", "^$", "./..."], signal, { directory });
       await verifyRepositoryProjection(workspace, projection, directory, signal);
-      if (!full) return { test, readiness: "Projected repository tests compiled without selecting tests." };
+      if (!full) return { result: { test, readiness: "Projected repository tests compiled without selecting tests." }, candidate: null };
       const vet = await workspace.run("go", ["vet", "./..."], signal, { directory });
       await verifyRepositoryProjection(workspace, projection, directory, signal);
       const build = await workspace.withTemporaryDirectory("build-", output => workspace.run("go", ["build", "-o", output, "./..."], signal, { directory }));
       await verifyRepositoryProjection(workspace, projection, directory, signal);
       const after = await snapshot(signal);
       if (frozen.fingerprint !== after.fingerprint) throw new Error("Repository changed during validation; rerun validation on the final changes");
-      validated = { ...projection, fingerprint: frozen.fingerprint };
-      return { test, vet, build, validatedFiles: frozen.selected, patchBytes: projection.patchBytes, patchFiles: projection.patchFiles };
+      return {
+        result: { test, vet, build, validatedFiles: frozen.selected, patchBytes: projection.patchBytes, patchFiles: projection.patchFiles },
+        candidate: { ...projection, fingerprint: frozen.fingerprint },
+      };
     });
+    signal.throwIfAborted();
+    if (full) validated = candidate;
+    return result;
   }
 
   /** @param {{action: string, branch?: string}} input @param {AbortSignal} signal */
@@ -309,9 +314,15 @@ function createCopilotSDKRepositoryRuntime(defineTool, profile, options) {
     const signals = [controller.signal, AbortSignal.timeout(duration)];
     if (invocation.signal) signals.push(invocation.signal);
     const signal = AbortSignal.any(signals);
+    if (parsed.action === "validate") validated = null;
     active = execute(parsed, signal).then(result => JSON.stringify({ action: parsed.action, ...result }));
     try {
-      return await active;
+      const result = await active;
+      signal.throwIfAborted();
+      return result;
+    } catch (error) {
+      if (parsed.action === "validate" || parsed.action === "readiness") validated = null;
+      return createRepositoryFailure(error, options?.diagnosticSecrets);
     } finally {
       active = null;
     }

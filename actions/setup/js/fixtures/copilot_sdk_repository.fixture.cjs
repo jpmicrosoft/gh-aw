@@ -27,6 +27,7 @@ const { restrictCopilotSDKRepositoryCatalog } = load("./copilot_sdk_tool_catalog
 const { buildCopilotSDKPermissionHandler } = load("./copilot_sdk_permissions.cjs");
 const { parseCopilotSDKMCPConfig } = load("./copilot_sdk_mcp_config.cjs");
 const { getPatchPathForBranch, getPatchPathForBranchInRepo } = load("./git_patch_utils.cjs");
+const { MAX_REPOSITORY_FAILURE_BYTES } = load("./copilot_sdk_repo_diagnostics.cjs");
 
 function prepareFixture(scratch, remaining) {
   const root = path.join(scratch, "checkout");
@@ -62,9 +63,13 @@ function prepareFixture(scratch, remaining) {
     }).trim();
   }
   git(["init", "-q", "-b", "main"]);
+  fs.writeFileSync(path.join(root, ".gitignore"), "validation-receipt.json\n");
   fs.writeFileSync(path.join(root, "go.mod"), "module fixture\n\ngo 1.20\n");
   fs.writeFileSync(path.join(root, "main.go"), 'package main\n\nimport "fmt"\n\nfunc greeting() string { return "Hello" }\n\nfunc main() { fmt.Println(greeting()) }\n');
-  fs.writeFileSync(path.join(root, "main_test.go"), 'package main\n\nimport "testing"\n\nfunc TestGreeting(t *testing.T) {\n\tif greeting() != "Hello" {\n\t\tt.Fatal("unexpected greeting")\n\t}\n}\n');
+  const testSource = 'package main\n\nimport "testing"\n\nfunc TestGreeting(t *testing.T) {\n\tif greeting() != "Hello" {\n\t\tt.Fatal("unexpected greeting")\n\t}\n}\n';
+  const diagnosticSource = "package diagnostics\n\nfunc Value() int { return 1 }\n";
+  fs.writeFileSync(path.join(root, "main_test.go"), testSource);
+  fs.writeFileSync(path.join(root, "docs", "diagnostic.go"), diagnosticSource);
   fs.writeFileSync(path.join(root, "README.md"), "A greeting command.\n");
   git(["add", "--all", "--", "."]);
   git(["commit", "-q", "-m", "Greeting command\n\nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"]);
@@ -113,7 +118,7 @@ function prepareFixture(scratch, remaining) {
     GOCACHE: goCache,
     GOMODCACHE: goModCache,
   });
-  return { root, sdkHome, loadSafeOutputs, branch, artifacts, minimalEnv, git, baseline, toolConfig, output };
+  return { root, sdkHome, loadSafeOutputs, branch, artifacts, minimalEnv, git, baseline, toolConfig, output, testSource, diagnosticSource };
 }
 
 async function main() {
@@ -140,11 +145,16 @@ async function main() {
   let repository;
   let client;
   let session;
+  let unsubscribe;
   let verifiedToolMetadata = [];
   let catalogVerified = false;
   let recorded = [];
   const permissionIdentities = [];
+  let permissionDenials = 0;
   const actions = [];
+  const nativeFailures = [];
+  const nativeEvents = [];
+  const operationTimings = [];
   async function checked(operation) {
     controller.signal.throwIfAborted();
     const result = await operation();
@@ -162,7 +172,7 @@ async function main() {
   }
   try {
     fixture = prepareFixture(scratch, remaining);
-    const { root, sdkHome, loadSafeOutputs, branch, minimalEnv, git, baseline, toolConfig } = fixture;
+    const { root, sdkHome, loadSafeOutputs, branch, minimalEnv, git, baseline, toolConfig, testSource, diagnosticSource } = fixture;
     const { MCPServer, MCPHTTPTransport } = load("./mcp_http_transport.cjs");
     const { createMCPServer } = loadSafeOutputs("./safe_outputs_mcp_server_http.cjs");
     const safeoutputs = createMCPServer().server;
@@ -250,7 +260,7 @@ async function main() {
     const mcpServers = parseCopilotSDKMCPConfig({
       mcpServers: Object.fromEntries(Object.entries(upstreamServers).map(([name, server]) => [name, { ...server, ...(gateway ? { url: `${gateway.address}/mcp/${name}`, headers: gateway.headers } : {}), tools: ["*"], timeout: 10_000 }])),
     });
-    repository = createCopilotSDKRepositoryRuntime(sdk.defineTool, toolConfig.profile);
+    repository = createCopilotSDKRepositoryRuntime(sdk.defineTool, toolConfig.profile, { diagnosticSecrets: [backendToken, ...Object.values(gateway?.headers ?? {})] });
     client = new sdk.CopilotClient({
       connection: sdk.RuntimeConnection.forStdio(),
       mode: "empty",
@@ -270,9 +280,11 @@ async function main() {
         client.createSession({
           model: "offline-fixture",
           provider: { type: "openai", baseUrl: `${address}/provider`, wireApi: "completions" },
-          onPermissionRequest: (request, invocation) => {
+          onPermissionRequest: async (request, invocation) => {
             permissionIdentities.push(Object.fromEntries(["kind", "serverName", "toolName"].filter(key => key in request).map(key => [key, request[key]])));
-            return permissionHandler(request, invocation);
+            const decision = await permissionHandler(request, invocation);
+            if (decision.kind === "reject") permissionDenials++;
+            return decision;
           },
           ...sessionTools,
           mcpServers,
@@ -292,6 +304,14 @@ async function main() {
       );
       for (const tool of mcpTools) assert.equal(tool.name, `${tool.mcpServerName}-${tool.mcpToolName}`, "Routed MCP catalogs must preserve canonical identities");
       catalogVerified = true;
+      const repositoryCalls = new Set();
+      let pendingCompletion;
+      unsubscribe = session.on(event => {
+        if (nativeEvents.length < 64) nativeEvents.push({ type: event.type, toolName: event.data.toolName ?? event.data.toolDescription?.name });
+        if (event.type === "external_tool.requested" && event.data.toolName === "go_repository") repositoryCalls.add(event.data.requestId);
+        if (event.type !== "external_tool.completed") return;
+        if (repositoryCalls.delete(event.data.requestId)) pendingCompletion?.resolve(event.data);
+      });
       const invoke = async (name, args) => {
         const result = await checked(() => session.rpc.tools.execute({ name, arguments: args }));
         assert.equal(result.resultType, "success", `${name}: ${result.textResultForLlm}`);
@@ -305,13 +325,61 @@ async function main() {
         const result = await checked(() => session.rpc.tools.execute({ name, arguments: {} }));
         assert.equal(result.resultType, "failure", `${name} must be unavailable`);
       }
-      const repo = async (action, extra = {}) => {
-        const result = await invoke("go_repository", { action, ...extra });
+      const nativeRepo = async (action, extra = {}) => {
+        assert.equal(pendingCompletion, undefined, "Repository invocations must stay sequential");
+        const completion = Promise.withResolvers();
+        pendingCompletion = completion;
         actions.push(action);
+        const timing = { action, durationMs: 0, resultType: "pending" };
+        operationTimings.push(timing);
+        const started = Date.now();
+        try {
+          const result = await checked(() => session.rpc.tools.execute({ name: "go_repository", arguments: { action, ...extra } }));
+          timing.resultType = result.resultType;
+          const event = await checked(() => withTimeout(() => completion.promise, Math.min(5_000, remaining()), `${action} native completion event`));
+          assert.ok(typeof event.requestId === "string" && event.requestId.length > 0, "External tool completion must correlate to a native request");
+          return { result, event };
+        } finally {
+          timing.durationMs = Date.now() - started;
+          pendingCompletion = undefined;
+        }
+      };
+      const repo = async (action, extra = {}) => {
+        const { result } = await nativeRepo(action, extra);
+        assert.equal(result.resultType, "success", `${action}: ${result.textResultForLlm}`);
         return JSON.parse(result.textResultForLlm);
+      };
+      const repoFailure = async (action, markers) => {
+        const { result, event } = await nativeRepo(action);
+        assert.equal(result.resultType, "failure", `${action}: native result must fail`);
+        assert.equal(typeof result.textResultForLlm, "string");
+        assert.equal(typeof result.error, "string");
+        assert.ok(Buffer.byteLength(JSON.stringify(result), "utf8") <= MAX_REPOSITORY_FAILURE_BYTES);
+        for (const marker of markers) {
+          assert.ok(result.textResultForLlm.includes(marker), `${action}: missing native result diagnostic ${marker}`);
+          assert.ok(result.error.includes(marker), `${action}: missing native error diagnostic ${marker}`);
+        }
+        nativeFailures.push({ action, resultType: result.resultType, textResultForLlm: result.textResultForLlm, error: result.error, completionRequestId: event.requestId });
+        assert.equal(git(["rev-parse", "HEAD"]), baseline, "Failed validation must not publish a commit");
       };
       await repo("status");
       await repo("prepare_branch", { branch });
+      const receiptSource =
+        testSource.replace('import "testing"', 'import (\n\t"os"\n\t"testing"\n)') +
+        '\nfunc TestReceipt(t *testing.T) {\n\tif err := os.WriteFile("validation-receipt.json", []byte("receipt"), 0o600); err != nil {\n\t\tt.Fatal(err)\n\t}\n}\n';
+      await invoke("edit", { path: path.join(root, "main_test.go"), old_str: testSource, new_str: receiptSource });
+      await repoFailure("validate", ["Go validation changed or added files", "untracked addition: validation-receipt.json"]);
+      assert.equal(fs.existsSync(path.join(root, "validation-receipt.json")), false, "The receipt belongs only to the rejected projection");
+      await repoFailure("commit", ["Run validate successfully"]);
+      const failingSource = testSource + '\nfunc TestFailure(t *testing.T) {\n\tt.Fatal("NATIVE_STDOUT_DIAGNOSTIC")\n}\n';
+      await invoke("edit", { path: path.join(root, "main_test.go"), old_str: receiptSource, new_str: failingSource });
+      // Go merges a test binary's streams. A second package's compiler failure
+      // exercises the go command's real stderr independently of test stdout.
+      await invoke("edit", { path: path.join(root, "docs", "diagnostic.go"), old_str: diagnosticSource, new_str: diagnosticSource.replace("return 1", "return NATIVE_STDERR_DIAGNOSTIC") });
+      await repoFailure("validate", ["go test failed with exit code 1", "stdout:", "stderr:", "NATIVE_STDOUT_DIAGNOSTIC", "NATIVE_STDERR_DIAGNOSTIC"]);
+      await repoFailure("commit", ["Run validate successfully"]);
+      await invoke("edit", { path: path.join(root, "main_test.go"), old_str: failingSource, new_str: testSource });
+      await invoke("edit", { path: path.join(root, "docs", "diagnostic.go"), old_str: diagnosticSource.replace("return 1", "return NATIVE_STDERR_DIAGNOSTIC"), new_str: diagnosticSource });
       await invoke("edit", { path: path.join(root, "main.go"), old_str: 'func greeting() string { return "Hello" }', new_str: '// greeting returns the default salutation.\nfunc greeting()string{return "Hello"}' });
       await invoke("create", { path: path.join(root, "docs", "usage.md"), file_text: "Run the command to print Hello.\n" });
       await repo("format");
@@ -333,6 +401,11 @@ async function main() {
   } finally {
     controller.abort(new Error("SDK repository fixture stopped"));
     repository?.abort();
+    try {
+      unsubscribe?.();
+    } catch (error) {
+      failures.push(error);
+    }
     if (repository) await cleanup("Repository cleanup", () => repository.close());
     if (session) await cleanup("Session disconnect", () => session.disconnect());
     if (client) {
@@ -381,6 +454,7 @@ async function main() {
     assert.equal(providerRequests, 0);
     assert.equal(unexpectedRequests, 0);
     assert.equal(backendAuthFailures, 0);
+    assert.equal(permissionDenials, 0);
     assert.deepEqual(backendErrors, []);
     if (!failures.length) {
       assert.ok(catalogVerified);
@@ -419,7 +493,11 @@ async function main() {
     backendRequests,
     nativeTools: verifiedToolMetadata.map(tool => tool.name),
     permissionIdentities,
+    permissionDenials,
     actions,
+    nativeFailures,
+    nativeEvents,
+    operationTimings,
     outputs: recorded.map(item => item.type),
     gateway: gatewayEvidence,
   };

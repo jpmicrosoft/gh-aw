@@ -8,6 +8,7 @@ const path = require("node:path");
 const { runCopilotSDKRepoProcess } = require("./copilot_sdk_repo_process.cjs");
 const { lstatGuard } = require("./symlink_guard.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { repositoryCommandError } = require("./copilot_sdk_repo_diagnostics.cjs");
 
 const MAX_REPOSITORY_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_REPOSITORY_FILES = 500;
@@ -130,9 +131,9 @@ function cacheDirectory(value, fallback, root) {
  * credentials, provider settings or GitHub Actions command-file variables.
  *
  * @param {import("./copilot_sdk_repo_policy.cjs").GoRepositoryProfile} profile
- * @param {{env?: NodeJS.ProcessEnv, runProcess?: typeof runCopilotSDKRepoProcess}} [options]
+ * @param {{env?: NodeJS.ProcessEnv, runProcess?: typeof runCopilotSDKRepoProcess, diagnosticSecrets?: string[]}} [options]
  */
-function createRepositoryWorkspace(profile, { env = process.env, runProcess = runCopilotSDKRepoProcess } = {}) {
+function createRepositoryWorkspace(profile, { env = process.env, runProcess = runCopilotSDKRepoProcess, diagnosticSecrets = [] } = {}) {
   if (!env.GITHUB_WORKSPACE || !path.isAbsolute(env.GITHUB_WORKSPACE)) throw new Error("go-repository requires an absolute GITHUB_WORKSPACE");
   const root = fs.realpathSync(env.GITHUB_WORKSPACE);
   const rootStat = lstatGuard(root);
@@ -253,7 +254,7 @@ function createRepositoryWorkspace(profile, { env = process.env, runProcess = ru
         maxOutputBytes,
       });
       if (!allowFailure && result.exitCode !== 0) {
-        throw new Error(`${executable} ${args[0]} failed with exit code ${result.exitCode}\n${result.stderr || result.stdout}`);
+        throw repositoryCommandError(`${executable} ${args[0]}`, result, diagnosticSecrets);
       }
       return result;
     }
@@ -279,8 +280,9 @@ function createRepositoryWorkspace(profile, { env = process.env, runProcess = ru
         try {
           await fs.promises.rm(directory, { recursive: true, maxRetries: 3, retryDelay: 100 });
         } catch (error) {
-          if (failed) throw new AggregateError([failure, error], `${getErrorMessage(failure)}; repository temporary cleanup failed: ${getErrorMessage(error)}`);
-          throw error;
+          const previous = failure && typeof failure === "object" && "cleanupErrors" in failure && Array.isArray(failure.cleanupErrors) ? failure.cleanupErrors : [];
+          const message = `${failed ? `${getErrorMessage(failure)}; ` : ""}repository temporary cleanup failed: ${getErrorMessage(error)}`;
+          throw Object.assign(new AggregateError(failed ? [failure, error] : [error], message), { cleanupErrors: [...previous, error] });
         }
       }
     }
@@ -290,7 +292,7 @@ function createRepositoryWorkspace(profile, { env = process.env, runProcess = ru
     function cleanup() {
       return fs.promises.rm(privateRoot, { recursive: true, maxRetries: 3, retryDelay: 100 });
     }
-    return { root, privateRoot, temporary, hooks, sourceCommit: env.GITHUB_SHA, childEnv, executables, run, withTemporaryDirectory, cleanup, cleanupSync };
+    return { root, privateRoot, temporary, hooks, sourceCommit: env.GITHUB_SHA, childEnv, executables, diagnosticSecrets, run, withTemporaryDirectory, cleanup, cleanupSync };
   } catch (error) {
     try {
       fs.rmSync(privateRoot, { recursive: true });
